@@ -98,10 +98,14 @@ export default function Landing(_props: Props) {
     isDemoSimulation,
     sseConnected,
     isBusy,
+    cockpitLocked,
+    unlockError,
+    unlockCockpit,
     executeDecision,
     triggerLifecycleAction,
   } = useCommanderEngine();
 
+  const [unlockToken, setUnlockToken] = useState("");
   const [redirectNote, setRedirectNote] = useState("");
   const [showRedirectInput, setShowRedirectInput] = useState(false);
   const [ledgerReply, setLedgerReply] = useState<string | null>(null);
@@ -327,6 +331,7 @@ export default function Landing(_props: Props) {
 
       const data = await response.json();
       const commanderReply =
+        (response.status === 401 ? "Cockpit locked. Unlock the live cockpit to query the ledger." : undefined) ||
         data?.reply ||
         "Ledger query complete. Only mechanical proof advances the step-gated airlock.";
 
@@ -383,6 +388,42 @@ export default function Landing(_props: Props) {
               />
               {sseConnected ? "LIVE ENGINE · SSE" : "LIVE ENGINE · HTTP"}
             </span>
+          )}
+
+          {/* Operator unlock: visitors see the labelled demo, an operator unlocks the live cockpit */}
+          {cockpitLocked && (
+            <form
+              data-testid="cockpit-unlock-form"
+              className="inline-flex flex-wrap items-center gap-1.5"
+              onSubmit={async (e) => {
+                e.preventDefault();
+                if (await unlockCockpit(unlockToken.trim())) setUnlockToken("");
+              }}
+            >
+              <input
+                data-testid="cockpit-unlock-input"
+                type="password"
+                autoComplete="off"
+                spellCheck={false}
+                value={unlockToken}
+                onChange={(e) => setUnlockToken(e.target.value)}
+                placeholder="Operator unlock token"
+                aria-label="Operator unlock token"
+                className="w-44 rounded-md border border-slate-600 bg-slate-950 px-2 py-0.5 text-xs text-slate-100 placeholder:text-slate-500 focus:border-cyan-400 focus:outline-none"
+              />
+              <button
+                type="submit"
+                disabled={unlockToken.trim().length === 0}
+                className="rounded-md border border-cyan-500/70 bg-cyan-950/70 px-2.5 py-0.5 text-xs font-bold tracking-wider uppercase text-cyan-100 disabled:opacity-40"
+              >
+                Unlock live cockpit
+              </button>
+              {unlockError && (
+                <span role="alert" className="text-xs text-red-300">
+                  {unlockError}
+                </span>
+              )}
+            </form>
           )}
 
           {/* Header Status Pill Strictly Bound to Live Mission State */}

@@ -498,6 +498,10 @@ export interface UseCommanderEngineResult {
   isDemoSimulation: boolean;
   sseConnected: boolean;
   isBusy: boolean;
+  /** True when the live cockpit needs the operator's unlock token. Visitors see the labelled demo in the meantime. */
+  cockpitLocked: boolean;
+  unlockError: string | null;
+  unlockCockpit: (token: string) => Promise<boolean>;
   refreshMission: (missionId?: string) => Promise<void>;
   refreshAudit: () => Promise<void>;
   executeDecision: (
@@ -522,9 +526,78 @@ export function useCommanderEngine(): UseCommanderEngineResult {
   const [isDemoSimulation, setIsDemoSimulation] = useState<boolean>(false);
   const [sseConnected, setSseConnected] = useState<boolean>(false);
   const [isBusy, setIsBusy] = useState<boolean>(false);
+  const [cockpitLocked, setCockpitLocked] = useState<boolean>(false);
+  const [unlockError, setUnlockError] = useState<string | null>(null);
+  // Bumped after a successful unlock so the live connection is rebuilt with the new session.
+  const [unlockEpoch, setUnlockEpoch] = useState<number>(0);
 
   const activeMissionIdRef = useRef<string | null>(null);
   const csrfTokenRef = useRef<string>("");
+
+  const showDemoSimulation = useCallback(() => {
+    const demo = createDemoSimulationPayload();
+    setMission(demo.mission);
+    setAudit(demo.audit);
+    setIsDemoSimulation(true);
+  }, []);
+
+  /**
+   * Makes sure there is an operator session. The server opens one automatically for a browser on the same machine in a
+   * development run; otherwise the operator unlocks with a token. The session cookie is HttpOnly, so this code never
+   * sees it: it only receives the per-session CSRF token.
+   */
+  const ensureSession = useCallback(async (): Promise<"live" | "locked"> => {
+    try {
+      const status = await fetch("/api/cockpit/session", { headers: { Accept: "application/json" } });
+      const s = await status.json();
+      if (s?.authenticated) {
+        if (s.csrf_token) csrfTokenRef.current = s.csrf_token;
+        return "live";
+      }
+      if (s?.auto_available) {
+        const opened = await fetch("/api/cockpit/session", {
+          method: "POST",
+          headers: { "Content-Type": "application/json", Accept: "application/json" },
+          body: "{}",
+        });
+        const o = await opened.json();
+        if (o?.authenticated) {
+          if (o.csrf_token) csrfTokenRef.current = o.csrf_token;
+          return "live";
+        }
+      }
+      return "locked";
+    } catch {
+      return "locked";
+    }
+  }, []);
+
+  const unlockCockpit = useCallback(async (token: string): Promise<boolean> => {
+    setUnlockError(null);
+    try {
+      const res = await fetch("/api/cockpit/session", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Accept: "application/json" },
+        body: JSON.stringify({ token }),
+      });
+      const data = await res.json();
+      if (!res.ok || !data?.authenticated) {
+        setUnlockError(
+          res.status === 429
+            ? `Too many attempts. Wait ${data?.retry_after ?? "a few"} seconds.`
+            : "Unlock token rejected."
+        );
+        return false;
+      }
+      if (data.csrf_token) csrfTokenRef.current = data.csrf_token;
+      setCockpitLocked(false);
+      setUnlockEpoch((n) => n + 1);
+      return true;
+    } catch {
+      setUnlockError("Could not reach the server.");
+      return false;
+    }
+  }, []);
 
   const applyMissionSnapshot = useCallback((rawMission: LiveMissionPayload) => {
     const sanitized = stripClientSecrets(rawMission);
@@ -543,6 +616,7 @@ export function useCommanderEngine(): UseCommanderEngineResult {
       const res = await fetch("/v1/audit/verify", {
         headers: { Accept: "application/json" },
       });
+      if (res.status === 401) setCockpitLocked(true);
       if (!res.ok) throw new Error(`audit verify status ${res.status}`);
       const data: AuditChainVerification = await res.json();
       setAudit(stripClientSecrets(data));
@@ -559,6 +633,7 @@ export function useCommanderEngine(): UseCommanderEngineResult {
           const listRes = await fetch("/v1/missions", {
             headers: { Accept: "application/json" },
           });
+          if (listRes.status === 401) setCockpitLocked(true);
           if (!listRes.ok) throw new Error(`missions list status ${listRes.status}`);
           const listData = await listRes.json();
           targetId = listData?.active_mission_id || listData?.missions?.[0]?.id;
@@ -568,60 +643,78 @@ export function useCommanderEngine(): UseCommanderEngineResult {
         const res = await fetch(`/v1/missions/${encodeURIComponent(targetId)}`, {
           headers: { Accept: "application/json" },
         });
+        if (res.status === 401) setCockpitLocked(true);
         if (!res.ok) throw new Error(`mission fetch status ${res.status}`);
         const data: LiveMissionPayload = await res.json();
         applyMissionSnapshot(data);
       } catch {
-        const demo = createDemoSimulationPayload();
-        setMission(demo.mission);
-        setAudit(demo.audit);
-        setIsDemoSimulation(true);
+        // Locked, offline or failing: show the clearly labelled demo, never silently-live data.
+        showDemoSimulation();
       }
     },
-    [applyMissionSnapshot]
+    [applyMissionSnapshot, showDemoSimulation]
   );
 
   // Connect to live SSE stream (/v1/events) + initial GET /v1/missions/:id & GET /v1/audit/verify
   useEffect(() => {
-    void refreshMission();
-    void refreshAudit();
+    let cancelled = false;
+    let es: EventSource | null = null;
 
-    if (typeof EventSource === "undefined") return;
+    void (async () => {
+      const session = await ensureSession();
+      if (cancelled) return;
+      setCockpitLocked(session === "locked");
+      if (session === "locked") {
+        // Visitors get the clearly labelled demo; the operator unlocks the live cockpit.
+        setSseConnected(false);
+        showDemoSimulation();
+        return;
+      }
 
-    const es = new EventSource("/v1/events");
+      void refreshMission();
+      void refreshAudit();
 
-    es.onopen = () => {
-      setSseConnected(true);
-      setIsDemoSimulation(false);
-    };
+      if (typeof EventSource === "undefined") return;
 
-    es.onmessage = (evt) => {
-      try {
-        const payload = JSON.parse(evt.data);
-        if (payload?.mission) {
-          applyMissionSnapshot(payload.mission);
-        } else if (payload?.missionId) {
-          void refreshMission(payload.missionId);
-        }
-        if (payload?.audit) {
-          setAudit(stripClientSecrets(payload.audit));
-        } else {
+      es = new EventSource("/v1/events");
+
+      es.onopen = () => {
+        setSseConnected(true);
+        setIsDemoSimulation(false);
+      };
+
+      es.onmessage = (evt) => {
+        try {
+          const payload = JSON.parse(evt.data);
+          if (payload?.mission) {
+            applyMissionSnapshot(payload.mission);
+          } else if (payload?.missionId) {
+            void refreshMission(payload.missionId);
+          }
+          if (payload?.audit) {
+            setAudit(stripClientSecrets(payload.audit));
+          } else {
+            void refreshAudit();
+          }
+        } catch {
+          void refreshMission();
           void refreshAudit();
         }
-      } catch {
-        void refreshMission();
-        void refreshAudit();
-      }
-    };
+      };
 
-    es.onerror = () => {
-      setSseConnected(false);
-    };
+      es.onerror = () => {
+        setSseConnected(false);
+        // A closed stream usually means the session ended (for example the server restarted). Re-check: a 401 flips the
+        // cockpit to the locked state instead of leaving stale data on screen.
+        if (es?.readyState === EventSource.CLOSED) void refreshMission();
+      };
+    })();
 
     return () => {
-      es.close();
+      cancelled = true;
+      es?.close();
     };
-  }, [applyMissionSnapshot, refreshAudit, refreshMission]);
+  }, [applyMissionSnapshot, ensureSession, refreshAudit, refreshMission, showDemoSimulation, unlockEpoch]);
 
   // Execute Authorize / Redirect / Kill via signed single-use tap link or CSRF-protected POST
   const executeDecision = useCallback(
@@ -663,6 +756,10 @@ export function useCommanderEngine(): UseCommanderEngineResult {
           });
         }
 
+        if (res.status === 401) {
+          setCockpitLocked(true);
+          return "Cockpit locked. Unlock it to act.";
+        }
         const data = await res.json();
         if (data?.mission) {
           applyMissionSnapshot(data.mission);
@@ -750,6 +847,10 @@ export function useCommanderEngine(): UseCommanderEngineResult {
           },
           body: JSON.stringify(body),
         });
+        if (res.status === 401) {
+          setCockpitLocked(true);
+          return "Cockpit locked. Unlock it to act.";
+        }
         const data = await res.json();
         if (data?.mission) {
           applyMissionSnapshot(data.mission);
@@ -782,6 +883,9 @@ export function useCommanderEngine(): UseCommanderEngineResult {
     isDemoSimulation,
     sseConnected,
     isBusy,
+    cockpitLocked,
+    unlockError,
+    unlockCockpit,
     refreshMission,
     refreshAudit,
     executeDecision,

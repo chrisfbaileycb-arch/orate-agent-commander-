@@ -1,7 +1,7 @@
 import express, { type Request, type Response } from "express";
 import path from "node:path";
 import fs from "node:fs";
-import { randomBytes } from "node:crypto";
+import { AsyncLocalStorage } from "node:async_hooks";
 import dotenv from "dotenv";
 import { GoogleGenAI } from "@google/genai";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
@@ -34,14 +34,34 @@ import {
   type VerifierSpec,
 } from "./src/commander/types.js";
 import type { Decision } from "./src/commander/approvals.js";
+import {
+  AttemptLimiter,
+  CockpitSessions,
+  RateLimiter,
+  authorizeRequest,
+  bodyCapFor,
+  handleSessionRequest,
+  loadSecurityConfig,
+  type Denied,
+} from "./src/server/security.js";
 
 dotenv.config();
 
 const app = express();
-const PORT = 3000;
 
-app.use(express.json({ limit: "2mb" }));
-app.use(express.urlencoded({ extended: false }));
+function envPort(raw: string | undefined): number {
+  if (!raw?.trim()) return 3000;
+  const n = Number(raw);
+  if (!Number.isInteger(n) || n < 0 || n > 65535) throw new Error(`PORT must be an integer from 0 to 65535, got "${raw}"`);
+  return n;
+}
+
+const PORT = envPort(process.env.PORT);
+// The preview and container platforms need 0.0.0.0. The network position is NOT the control: every route is behind the
+// security gate below, and nothing is reachable without a credential.
+const HOST = process.env.HOST?.trim() || "0.0.0.0";
+
+// The body parsers are registered after the security gate (see below), so a request that is refused is never parsed.
 
 // Initialize Google GenAI with recommended telemetry header
 const geminiApiKey = process.env.GEMINI_API_KEY || "";
@@ -56,8 +76,26 @@ const ai = new GoogleGenAI({
 
 const DEFAULT_GEMINI_MODEL = "gemini-3.8-flash";
 
-// Ephemeral per-process CSRF token for cockpit state-changing POST requests
-const sessionCsrfToken = randomBytes(24).toString("base64url");
+/* -------------------------------------------------------------------------- */
+/* SECURITY: SESSIONS, LIMITS, REQUEST CONTEXT (see src/server/security.ts)   */
+/* -------------------------------------------------------------------------- */
+
+const security = loadSecurityConfig(process.env);
+const cockpitSessions = new CockpitSessions({ ttlMs: security.sessionTtlMs, max: security.maxSessions });
+const unlockLimiter = new AttemptLimiter(8, 10 * 60_000);
+const studioPerClient = new RateLimiter(security.studioRpm, 60_000);
+const studioGlobal = new RateLimiter(security.studioGlobalRpm, 60_000);
+const MAX_SSE_CLIENTS = 25;
+
+/**
+ * Carries the CSRF token of the session that made the current request, so the payload builders can include it for that
+ * client alone. Broadcast payloads are built in an empty context and therefore never contain one.
+ */
+const requestContext = new AsyncLocalStorage<{ csrf?: string }>();
+
+const trustProxyHops = Number(process.env.COMMANDER_TRUST_PROXY);
+if (Number.isInteger(trustProxyHops) && trustProxyHops > 0) app.set("trust proxy", trustProxyHops);
+app.disable("x-powered-by");
 
 // Load COMMANDER_SOUL.md specification
 const COMMANDER_SOUL_PATH = path.resolve(process.cwd(), "COMMANDER_SOUL.md");
@@ -82,30 +120,41 @@ function enforceCommanderVoice(raw: string): string {
 /* AGENT COMMANDER CONTROL PLANE INITIALIZATION (AIRLOCK + SENTINEL + WITNESS)*/
 /* -------------------------------------------------------------------------- */
 
-const ADMIN_TOKEN = process.env.COMMANDER_ADMIN_TOKEN || "commander-sovereign-admin-token-2026";
+const baseConfig = loadConfig({
+  ...process.env,
+  COMMANDER_PUBLIC_URL: process.env.COMMANDER_PUBLIC_URL || `http://localhost:${PORT}`,
+  PORT: String(PORT),
+  HOST,
+});
+
+/**
+ * Independent witnessing. By default the witness can INSPECT FILES under the working directory and can run NOTHING (the
+ * executable allowlist is empty), which is enough for the demo mission's file check. Letting it run commands executes
+ * code on this machine against a workspace the worker controls, so that is opt-in: set COMMANDER_WITNESS_MODE=local with
+ * COMMANDER_WITNESS_ROOT, COMMANDER_WITNESS_ALLOW and COMMANDER_WITNESS_TENANTS. COMMANDER_WITNESS_MODE=off disables it.
+ */
+const INSPECT_ONLY_WITNESS = {
+  mode: "local" as const,
+  root: process.cwd(),
+  allow: [] as string[],
+  path: process.env.PATH || "/usr/local/bin:/usr/bin:/bin",
+  tenants: "*" as const,
+  concurrency: 2,
+};
+
 const commanderConfig = {
-  ...loadConfig({
-    ...process.env,
-    PORT: String(PORT),
-    HOST: "0.0.0.0",
-    PUBLIC_URL: `http://localhost:${PORT}`,
-  }),
-  adminToken: ADMIN_TOKEN,
+  ...baseConfig,
+  adminToken: security.adminToken,
   geminiApiKey: geminiApiKey || undefined,
   geminiModel: DEFAULT_GEMINI_MODEL,
   policy: {
     ...defaultPolicy(),
     egress_allowlist: ["registry.example.com", "api.github.com", "*.npmjs.org"],
   },
-  witness: {
-    mode: "local" as const,
-    root: process.cwd(),
-    allow: ["node", "ls", "cat", "head", "echo", "true"],
-    path: process.env.PATH || "/usr/local/bin:/usr/bin:/bin",
-    tenants: "*" as const,
-    concurrency: 2,
-  },
+  witness: process.env.COMMANDER_WITNESS_MODE?.trim() ? baseConfig.witness : INSPECT_ONLY_WITNESS,
 };
+const witnessAvailable = commanderConfig.witness.mode === "local";
+const witnessCanRunCommands = witnessAvailable && commanderConfig.witness.allow.length > 0;
 
 const commander = createApp({ config: commanderConfig });
 const standaloneSentinel = new Sentinel(commanderConfig.policy, commander.clock);
@@ -124,20 +173,26 @@ const DEFAULT_MISSION_DEF = {
   title: "Release 4.2 · Sovereign Production Cutover",
   steps: [
     {
-      title: "Run Mechanical Test Suite & Witness Verification",
+      title: witnessAvailable ? "Run Mechanical Test Suite & Witness Verification" : "Run Mechanical Test Suite",
       directive:
-        "Execute full unit and integration test suite. Report real exit_code 0, raw test counts in stdout, echo the active attempt nonce, and pass independent LocalWitness inspection of package.json.",
+        "Execute full unit and integration test suite. Report real exit_code 0, raw test counts in stdout, echo the active attempt nonce" +
+        (witnessAvailable ? ", and pass independent LocalWitness inspection of package.json." : "."),
       risk_tier: "routine" as const,
       max_attempts: 3,
       require_nonce: true,
       proof: [
-        {
-          type: "witness_file" as const,
-          path: "package.json",
-          min_bytes: 50,
-          regex: "orator-ai-forge",
-          flags: "",
-        },
+        // Only when a witness exists: a mission that asks for one where none is available is rejected at open.
+        ...(witnessAvailable
+          ? [
+              {
+                type: "witness_file" as const,
+                path: "package.json",
+                min_bytes: 50,
+                regex: "orator-ai-forge",
+                flags: "",
+              },
+            ]
+          : []),
         { type: "exit_code" as const, expected: 0 },
         { type: "regex" as const, target: "stdout", pattern: "\\d+ passed", flags: "", must_match: true },
         { type: "nonce_present" as const },
@@ -353,12 +408,22 @@ function summarizeAuditEvent(
   }
 }
 
+/**
+ * The HUD, its event log and the live stream belong to the cockpit's own sandbox tenant. A mission that belongs to any
+ * other tenant is that tenant's alone: it never moves the cockpit's pointer and is never broadcast into its stream.
+ */
+function isCockpitMission(missionId: string): boolean {
+  const m = Object.hasOwn(commander.store.state.missions, missionId) ? commander.store.state.missions[missionId] : undefined;
+  return m?.tenantId === defaultTenantId;
+}
+
 function recordMissionEvent(
   missionId: string,
   type: string,
   explicitSummary?: string,
   explicitSphereState?: AirlockSphereState
-): MissionLastEvent {
+): MissionLastEvent | undefined {
+  if (!isCockpitMission(missionId)) return undefined;
   const latestAudit = commander.store.tenantAudit(defaultTenantId, 1)[0];
   const seq = latestAudit?.seq ?? 1;
   const ts = latestAudit?.ts ?? new Date(commander.clock()).toISOString();
@@ -560,7 +625,7 @@ function buildLiveMissionPayload(missionId: string = activeMissionId) {
       totalEvents: auditVerification.ok ? auditVerification.count : 0,
     },
     mission_view: missionViewData,
-    csrf_token: sessionCsrfToken,
+    csrf_token: requestContext.getStore()?.csrf,
   };
 }
 
@@ -593,19 +658,22 @@ function buildCockpitSnapshot() {
       name: "COMMANDER_SOUL",
       voiceProfile: VOICE_PROFILE,
     },
-    csrf_token: sessionCsrfToken,
+    csrf_token: requestContext.getStore()?.csrf,
   };
 }
 
 function broadcastSse(eventType: string, missionId: string = activeMissionId) {
-  if (sseClients.size === 0) return;
-  const payload = JSON.stringify({
-    type: eventType,
-    ts: new Date(commander.clock()).toISOString(),
-    missionId,
-    mission: buildLiveMissionPayload(missionId),
-    audit: buildAuditVerificationPayload(defaultTenantId),
-  });
+  if (sseClients.size === 0 || !isCockpitMission(missionId)) return;
+  // Built in an EMPTY request context: this payload goes to every connected client, so it must carry no session's CSRF token.
+  const payload = requestContext.run({}, () =>
+    JSON.stringify({
+      type: eventType,
+      ts: new Date(commander.clock()).toISOString(),
+      missionId,
+      mission: buildLiveMissionPayload(missionId),
+      audit: buildAuditVerificationPayload(defaultTenantId),
+    })
+  );
   for (const client of sseClients) {
     try {
       client.write(`data: ${payload}\n\n`);
@@ -615,21 +683,128 @@ function broadcastSse(eventType: string, missionId: string = activeMissionId) {
   }
 }
 
-/** Resolve principal from Authorization header or fall back to default principal for seamless cockpit operation */
-function resolvePrincipal(req: Request, fallbackRole: "operator" | "worker" = "operator"): Principal {
-  const authHeader = req.headers.authorization;
-  if (authHeader) {
-    return commander.auth.authenticate(authHeader);
-  }
-  return fallbackRole === "operator" ? defaultOperatorPrincipal : defaultWorkerPrincipal;
+/* -------------------------------------------------------------------------- */
+/* SECURITY GATE: deny by default (the route table is in src/server/security.ts) */
+/* -------------------------------------------------------------------------- */
+
+interface RequestLocals {
+  principal?: Principal;
+  cockpit?: boolean;
 }
 
+/**
+ * The principal behind this request, and it must hold the role the route needs. A bearer route uses the authenticated
+ * key. A cockpit route acts as the cockpit's own sandbox tenant. There is no anonymous fallback.
+ */
+function resolvePrincipal(req: Request, role: "operator" | "worker" = "operator"): Principal {
+  const locals = (req.res?.locals ?? {}) as RequestLocals;
+  const principal = locals.principal ?? (locals.cockpit ? (role === "operator" ? defaultOperatorPrincipal : defaultWorkerPrincipal) : undefined);
+  if (!principal) throw new CommanderError("UNAUTHENTICATED", say.unauthenticated());
+  // A worker key must never reach an operator route (approving its own staged actions, minting keys) or the reverse.
+  commander.auth.requireRole(principal, role);
+  return principal;
+}
+
+/** The gate already enforced the session's CSRF token on every state-changing cockpit request; this asserts the request came through it. */
 function verifyCockpitCsrf(req: Request): void {
-  const token = req.headers["x-csrf-token"];
-  if (!token || token !== sessionCsrfToken) {
+  if (!(req.res?.locals as RequestLocals | undefined)?.cockpit) {
     throw new CommanderError("FORBIDDEN", say.forbidden());
   }
 }
+
+app.use((req, res, next) => {
+  res.setHeader("X-Content-Type-Options", "nosniff");
+  res.setHeader("Referrer-Policy", "no-referrer");
+  if (/^\/(?:v1|api)(?:\/|$)/i.test(req.path)) res.setHeader("Cache-Control", "no-store");
+  next();
+});
+
+const clientKeyOf = (req: Request): string => req.ip || req.socket.remoteAddress || "unknown";
+
+function sendDenied(res: Response, d: Denied) {
+  res.status(d.status).json({ error: d.code, message: d.message });
+}
+
+app.use((req, res, next) => {
+  const decision = authorizeRequest(
+    { method: req.method, path: req.path, headers: req.headers },
+    { config: security, sessions: cockpitSessions },
+  );
+  if (!decision.ok) return sendDenied(res, decision);
+
+  const cap = bodyCapFor(req.path);
+  if (cap !== undefined && Number(req.headers["content-length"] ?? 0) > cap) {
+    return void res.status(413).json({ error: "PAYLOAD_TOO_LARGE", message: `Request body exceeds ${cap} bytes.` });
+  }
+
+  switch (decision.via) {
+    case "bearer":
+      try {
+        res.locals.principal = commander.auth.authenticate(decision.authorization!);
+      } catch (err) {
+        return handleCommanderError(err, res);
+      }
+      return next();
+    case "studio": {
+      const mine = studioPerClient.allow(clientKeyOf(req));
+      const all = studioGlobal.allow("*");
+      const blocked = !mine.ok ? mine : !all.ok ? all : undefined;
+      if (blocked) {
+        res.setHeader("Retry-After", String(blocked.retryAfterSec));
+        return void res
+          .status(429)
+          .json({ error: "THROTTLED", message: "Rate limit reached. Try again shortly.", retry_after: blocked.retryAfterSec });
+      }
+      return next();
+    }
+    case "cockpit":
+      res.locals.cockpit = true;
+      return requestContext.run({ csrf: decision.csrf }, next);
+    default:
+      return next();
+  }
+});
+
+// Parsed only after the gate, so a refused request costs nothing.
+app.use(express.json({ limit: "2mb" }));
+app.use(express.urlencoded({ extended: false }));
+
+// A malformed body is a 400 in the engine's error shape, never a stack trace.
+app.use((err: unknown, _req: Request, res: Response, next: (e?: unknown) => void) => {
+  const status = (err as { status?: number } | null)?.status;
+  if (typeof status === "number" && status >= 400 && status < 500) {
+    return void res.status(status).json({ error: "INVALID", message: "Malformed request body." });
+  }
+  next(err);
+});
+
+// Chunked bodies carry no Content-Length, so the size cap is enforced again on what was actually parsed.
+app.use((req, res, next) => {
+  const cap = bodyCapFor(req.path);
+  if (cap !== undefined && req.body && JSON.stringify(req.body).length > cap) {
+    return void res.status(413).json({ error: "PAYLOAD_TOO_LARGE", message: `Request body exceeds ${cap} bytes.` });
+  }
+  next();
+});
+
+// Unlock / status / logout for the operator cockpit.
+app.all("/api/cockpit/session", (req, res) => {
+  const forwardedProto = String(req.headers["x-forwarded-proto"] ?? "").split(",")[0]!.trim().toLowerCase();
+  const out = handleSessionRequest(
+    {
+      method: req.method,
+      body: req.body,
+      headers: req.headers,
+      clientKey: clientKeyOf(req),
+      remoteAddress: req.socket.remoteAddress,
+      secureTransport: req.secure || forwardedProto === "https",
+    },
+    { config: security, sessions: cockpitSessions, limiter: unlockLimiter },
+  );
+  if (out.setCookie) res.setHeader("Set-Cookie", out.setCookie);
+  if (out.retryAfterSec) res.setHeader("Retry-After", String(out.retryAfterSec));
+  res.status(out.status).json(out.body);
+});
 
 function handleCommanderError(err: unknown, res: Response) {
   if (err instanceof CommanderError) {
@@ -656,6 +831,9 @@ app.get("/healthz", (_req, res) => {
 
 // Live SSE Event Stream (/v1/events)
 app.get("/v1/events", (req, res) => {
+  if (sseClients.size >= MAX_SSE_CLIENTS) {
+    return void res.status(429).json({ error: "THROTTLED", message: "Too many live connections. Close one and retry." });
+  }
   res.setHeader("Content-Type", "text/event-stream");
   res.setHeader("Cache-Control", "no-cache, no-transform");
   res.setHeader("Connection", "keep-alive");
@@ -761,8 +939,9 @@ app.post("/a/:id/decide", (req, res) => {
     const decided = commander.airlock.decideApproval(a.tenantId, id, decision, note, "link");
 
     // Re-issue directive lease if a quarantined step was re-opened
+    // Only the cockpit's own sandbox tenant can be re-leased here; an approval from another tenant is decided and left alone.
     const m = commander.store.state.missions[a.missionId];
-    if (m && m.status === "active" && decision !== "kill") {
+    if (m && a.tenantId === defaultTenantId && m.status === "active" && decision !== "kill") {
       const s = m.steps[m.current];
       if (s && !s.lease) {
         commander.airlock.getDirective(defaultWorkerPrincipal, a.missionId);
@@ -787,7 +966,8 @@ app.post("/a/:id/decide", (req, res) => {
       ok: true,
       status: decided.status,
       message: voiceMessage,
-      mission: buildLiveMissionPayload(a.missionId),
+      // The cockpit payload exists only for the sandbox tenant; building it for another tenant's mission would fail after the decision had already committed.
+      mission: isCockpitMission(a.missionId) ? buildLiveMissionPayload(a.missionId) : undefined,
     });
   } catch (err) {
     handleCommanderError(err, res);
@@ -914,8 +1094,11 @@ app.post("/v1/operator/missions", (req, res) => {
   try {
     const principal = resolvePrincipal(req, "operator");
     const created = commander.airlock.openMission(principal, req.body);
-    activeMissionId = created.id;
-    recordMissionEvent(activeMissionId, "mission.opened", undefined, "idle");
+    // Only the cockpit's own sandbox tenant moves the cockpit's pointer. Another tenant's mission is theirs alone.
+    if (principal.tenantId === defaultTenantId) {
+      activeMissionId = created.id;
+      recordMissionEvent(activeMissionId, "mission.opened", undefined, "idle");
+    }
     res.status(201).json(created);
   } catch (err) {
     handleCommanderError(err, res);
@@ -1838,7 +2021,7 @@ async function startServer() {
   if (!isProd) {
     const { createServer } = await import("vite");
     const vite = await createServer({
-      server: { middlewareMode: true, host: "0.0.0.0", port: PORT },
+      server: { middlewareMode: true, host: HOST, port: PORT },
       appType: "spa",
     });
     app.use(vite.middlewares);
@@ -1850,9 +2033,30 @@ async function startServer() {
     });
   }
 
-  app.listen(PORT, "0.0.0.0", () => {
-    console.log(`[ORATOR // AGENT COMMANDER] Server running on http://0.0.0.0:${PORT}`);
-    console.log(`[ORATOR // AGENT COMMANDER] Airlock, Sentinel & Verifier routes mounted (/v1/* & /api/commander/*)`);
+  app.listen(PORT, HOST, () => {
+    console.log(`[ORATOR // AGENT COMMANDER] Server running on http://${HOST}:${PORT}`);
+    console.log(`[ORATOR // AGENT COMMANDER] Airlock, Sentinel & Verifier routes mounted (/v1/* & /api/commander/*), all behind the security gate`);
+    if (security.cockpitTokenGenerated) {
+      console.log(`[COCKPIT] Unlock token for this run: ${security.cockpitToken}`);
+      console.log(`[COCKPIT] It changes on every restart. Set COMMANDER_COCKPIT_TOKEN (16+ characters) to keep one.`);
+      if (security.autoLocalSession) {
+        console.log(`[COCKPIT] A browser on this machine (http://localhost:${PORT}) is unlocked automatically.`);
+      }
+    } else {
+      console.log(`[COCKPIT] Unlock token loaded from COMMANDER_COCKPIT_TOKEN.`);
+    }
+    console.log(
+      security.adminToken
+        ? `[ADMIN] /v1/admin is enabled (COMMANDER_ADMIN_TOKEN).`
+        : `[ADMIN] COMMANDER_ADMIN_TOKEN is not set: /v1/admin is disabled.`
+    );
+    console.log(
+      !witnessAvailable
+        ? `[WITNESS] Off.`
+        : witnessCanRunCommands
+        ? `[WITNESS] ENABLED and may run: ${commanderConfig.witness.allow.join(", ")} (workspace ${commanderConfig.witness.root}). This executes code on this machine; use it only where you trust the workspace.`
+        : `[WITNESS] Inspect-only: it can read files under the workspace and cannot run commands.`
+    );
   });
 }
 
