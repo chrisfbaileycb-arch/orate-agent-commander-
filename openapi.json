@@ -1,0 +1,44 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "ORATOR.AI Forge API",
+    "description": "HTTP + SSE contract for the Orator autonomous software forge appliance. All timestamps are ISO-8601 UTC. All secrets are supplied via environment variables only.",
+    "version": "3.5.0"
+  },
+  "servers": [{ "url": "/" }],
+  "paths": {
+    "/api/health": { "get": { "operationId": "health", "responses": { "200": { "description": "ONLINE + telemetry snapshot" } } } },
+    "/api/state": { "get": { "operationId": "state", "responses": { "200": { "description": "Session + allowance state" } } } },
+    "/api/models": { "get": { "operationId": "models", "responses": { "200": { "description": "Configured model roster" } } } },
+    "/api/knowledge": { "get": { "operationId": "knowledge", "responses": { "200": { "description": "Skill-codex repositories" } } } },
+    "/api/stream": { "get": { "operationId": "sseStream", "responses": { "200": { "description": "SSE rotation telemetry" } } } },
+    "/api/upload-intake": { "post": { "operationId": "uploadIntake", "requestBody": { "content": { "application/json": { "schema": { "$ref": "#/components/schemas/IntakePayload" } } } }, "responses": { "200": { "description": "ACCEPTED (documents, images, code; video refused)" } } } },
+    "/api/interrogate": { "post": { "operationId": "interrogate", "requestBody": { "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Interrogation" } } } }, "responses": { "200": { "description": "Anti-slop evaluation" } } } },
+    "/api/audit": { "post": { "operationId": "audit", "responses": { "200": { "description": "22-point invariant audit over latest manufactured files" } } } },
+    "/api/manufacture-sim": { "post": { "operationId": "manufactureSim", "responses": { "200": { "description": "MANUFACTURED package + audit report" } } } },
+    "/api/stream-manufacture": { "get": { "operationId": "streamManufacture", "responses": { "200": { "description": "SSE forge pipeline (8 skills)" } } } },
+    "/api/download-zip": { "post": { "operationId": "downloadZip", "responses": { "200": { "description": "Sealed ZIP delivery" } } } },
+    "/api/mark-paid": { "post": { "operationId": "markPaid", "responses": { "200": { "description": "Charter activation" } } } },
+    "/api/preview": { "get": { "operationId": "preview", "responses": { "200": { "description": "Sandbox preview of the manufactured client" } } } },
+    "/api/chat": { "post": { "operationId": "chat", "responses": { "200": { "description": "Conversational inquest endpoint" } } } }
+  },
+  "components": {
+    "schemas": {
+      "IntakePayload": {
+        "type": "object",
+        "properties": {
+          "filename": { "type": "string" },
+          "content": { "type": "string" },
+          "type": { "type": "string", "enum": ["markdown", "image", "code"] }
+        }
+      },
+      "Interrogation": {
+        "type": "object",
+        "properties": {
+          "prompt": { "type": "string" },
+          "moat": { "type": "string" }
+        }
+      }
+    }
+  }
+}

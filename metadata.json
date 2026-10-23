@@ -1,0 +1,10 @@
+{
+  "name": "ORATOR.AI — The Autonomous Software Forge",
+  "description": "A closed-loop digital manufacturing appliance: 16-model MoE routing, 15-question inquest, 22-point audit, and instant ZIP delivery of production-grade software.",
+  "requestFramePermissions": [
+    "microphone"
+  ],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}

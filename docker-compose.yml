@@ -1,0 +1,13 @@
+services:
+  orator:
+    build: .
+    container_name: orator-ai
+    ports:
+      - "8080:8080"
+    environment:
+      PORT: "8080"
+      # Keys are read from the host environment only — never commit values.
+      OPENROUTER_API_KEY: "${OPENROUTER_API_KEY:-}"
+      OPENAI_API_KEY: "${OPENAI_API_KEY:-}"
+      GEMINI_API_KEY: "${GEMINI_API_KEY:-}"
+    restart: unless-stopped
