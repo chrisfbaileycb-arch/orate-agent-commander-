@@ -10,7 +10,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "node \"/ABSOLUTE/PATH/TO/agent-commander/dist/guard/claude-hook.js\"",
+            "command": "node \"/ABSOLUTE/PATH/TO/agent-commander/dist/guard/claude-hook.js\" || exit 2",
             "timeout": 15
           }
         ]

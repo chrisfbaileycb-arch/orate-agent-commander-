@@ -1,9 +1,10 @@
 import { execFileSync, spawnSync } from 'node:child_process';
-import { copyFileSync, mkdtempSync, readdirSync, readFileSync, rmSync } from 'node:fs';
+import { copyFileSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
+import { settingsSnippet } from './guard/hook.js';
 
 /**
  * The artifact a developer actually puts in their Claude Code settings: `npm run build:guard` output, copied on its own
@@ -96,6 +97,62 @@ describe('the bundled guard', () => {
     expect(r.code).toBe(0);
     const s = JSON.parse(r.stdout) as { env: Record<string, string>; hooks: { PreToolUse: { hooks: { command: string }[] }[] } };
     expect(s.env).toMatchObject({ COMMANDER_URL: 'https://commander.example', COMMANDER_MISSION: 'msn_1' });
-    expect(s.hooks.PreToolUse[0]!.hooks[0]!.command).toBe(`node "${hook}"`);
+    expect(s.hooks.PreToolUse[0]!.hooks[0]!.command).toBe(`node "${hook}" || exit 2`);
+  });
+});
+
+// Claude Code blocks a tool call only on exit code 2; any other non-zero exit is a non-blocking error and the call proceeds.
+// So the command it runs is what has to fail closed, including when the hook cannot start at all.
+describe('the installed command', () => {
+  const commandFor = (hookPath: string) => settingsSnippet(hookPath).hooks.PreToolUse[0]!.hooks[0]!.command;
+
+  function viaShell(hookPath: string, input: unknown = bash('ls'), env: Record<string, string> = local) {
+    const r = spawnSync('sh', ['-c', commandFor(hookPath)], {
+      cwd: bare,
+      input: JSON.stringify(input),
+      env: { PATH: process.env.PATH ?? '', HOME: process.env.HOME ?? '', ...env },
+      encoding: 'utf8',
+      timeout: 30_000,
+    });
+    return { code: r.status, stdout: r.stdout, stderr: r.stderr };
+  }
+
+  const script = (name: string, body: string) => {
+    const p = path.join(bare, name);
+    writeFileSync(p, body);
+    return p;
+  };
+
+  it("leaves the hook's own verdicts alone: allow stays 0, a block stays 2 and keeps its reason", () => {
+    expect(viaShell(hook).code).toBe(0);
+    const denied = viaShell(hook, bash('rm -rf /'));
+    expect(denied.code).toBe(2);
+    expect(denied.stderr).toContain('COMMANDER GUARD // DENIED');
+  });
+
+  it.each([
+    ['exits with code 1', 'process.exit(1);'],
+    ['has a syntax error', 'this is not javascript ('],
+    ['throws', 'throw new Error("boom");'],
+    ['is killed by a signal', 'process.kill(process.pid, "SIGKILL");'],
+  ])('blocks when the hook %s, where a bare node run would have let the call through', (_why, body) => {
+    const crashing = script(`crash-${Math.random().toString(36).slice(2)}.js`, body);
+    const bare_ = spawnSync(process.execPath, [crashing], { cwd: bare, encoding: 'utf8', input: '{}' });
+    expect(bare_.status, 'the unprotected exit code').not.toBe(2);
+    expect(bare_.status, 'the unprotected exit code').not.toBe(0);
+    expect(viaShell(crashing).code).toBe(2);
+  });
+
+  it('blocks when the hook file is missing', () => {
+    expect(viaShell(path.join(bare, 'does-not-exist.js')).code).toBe(2);
+  });
+
+  it('blocks when node itself cannot be found', () => {
+    const r = spawnSync('/bin/sh', ['-c', commandFor(hook)], { cwd: bare, input: JSON.stringify(bash('ls')), env: { PATH: '/nonexistent', ...local }, encoding: 'utf8', timeout: 30_000 });
+    expect(r.status).toBe(2);
+  });
+
+  it('does not turn a hook that exits 0 into a block', () => {
+    expect(viaShell(script('allow.js', 'process.exit(0);')).code).toBe(0);
   });
 });

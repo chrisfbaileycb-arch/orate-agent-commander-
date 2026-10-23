@@ -370,14 +370,24 @@ describe('settingsSnippet and the shipped Claude Code configuration', () => {
     expect(s.hooks.PreToolUse).toHaveLength(1);
     const entry = s.hooks.PreToolUse[0]!;
     expect(entry.matcher).toBe(GUARDED_TOOLS.join('|'));
-    expect(entry.hooks).toEqual([{ type: 'command', command: 'node "/opt/agent-commander/dist/guard/claude-hook.js"', timeout: 15 }]);
+    expect(entry.hooks).toEqual([{ type: 'command', command: 'node "/opt/agent-commander/dist/guard/claude-hook.js" || exit 2', timeout: 15 }]);
   });
 
-  it('quotes the path so one with spaces or shell characters still runs as written', () => {
-    const hookPath = '/Users/me/My Tools/$(id)/claude-hook.js';
+  it('quotes the path so one with spaces is kept as a single argument', () => {
+    const hookPath = '/Users/me/My Tools/claude-hook.js';
     const cmd = settingsSnippet(hookPath).hooks.PreToolUse[0]!.hooks[0]!.command;
-    expect(cmd.startsWith('node ')).toBe(true);
-    expect(JSON.parse(cmd.slice('node '.length))).toBe(hookPath);
+    expect(cmd).toBe(`node "${hookPath}" || exit 2`);
+  });
+
+  it.each(['/Users/me/$(id)/claude-hook.js', '/tmp/`id`/claude-hook.js', '/tmp/a"b/claude-hook.js', '/tmp/$HOME/claude-hook.js', 'C:\\%TEMP%\\claude-hook.js', '/tmp/a\nb/claude-hook.js'])(
+    'refuses a path a shell would expand inside the quotes (%j), instead of emitting a command that runs it',
+    (hookPath) => {
+      expect(() => settingsSnippet(hookPath)).toThrow(/cannot be quoted safely/);
+    },
+  );
+
+  it('still accepts an ordinary Windows path', () => {
+    expect(settingsSnippet('C:\\Users\\me\\tools\\claude-hook.js').hooks.PreToolUse[0]!.hooks[0]!.command).toBe('node "C:\\\\Users\\\\me\\\\tools\\\\claude-hook.js" || exit 2');
   });
 
   it('adds an env block only when asked, and never one that could hold the key', () => {

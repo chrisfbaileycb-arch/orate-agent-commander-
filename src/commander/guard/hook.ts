@@ -148,8 +148,20 @@ export async function localEvaluate(policyFile?: string): Promise<Evaluate> {
 
 // ---- configuration helper ---------------------------------------------------------------------
 
-/** The Claude Code settings fragment that installs the guard. `COMMANDER_KEY` is deliberately never written to a file. */
+// Inside double quotes a shell still expands these, so a path containing one would run as code rather than name a file.
+const UNQUOTABLE = /["$`%\r\n]/;
+
+/**
+ * The Claude Code settings fragment that installs the guard. `COMMANDER_KEY` is deliberately never written to a file.
+ *
+ * The command ends `|| exit 2`. Claude Code blocks a tool call only on exit code 2 and treats any other non-zero exit as a
+ * non-blocking error, so a hook that cannot even start (a missing file, an unsupported Node, a corrupt install) would
+ * otherwise exit 1 and let every call through. The hook's own verdicts, 0 and 2, pass through unchanged.
+ */
 export function settingsSnippet(hookPath: string, opts: { url?: string; mission?: string } = {}) {
+  if (UNQUOTABLE.test(hookPath)) {
+    throw new Error(`The hook path ${JSON.stringify(hookPath)} contains a character that cannot be quoted safely in a shell command (one of " $ \` % or a line break). Move the file to a plainer path.`);
+  }
   return {
     ...(opts.url || opts.mission
       ? { env: { COMMANDER_URL: opts.url ?? 'https://commander.example.com', COMMANDER_MISSION: opts.mission ?? 'msn_REPLACE_WITH_YOUR_MISSION_ID' } }
@@ -158,7 +170,7 @@ export function settingsSnippet(hookPath: string, opts: { url?: string; mission?
       PreToolUse: [
         {
           matcher: GUARDED_TOOLS.join('|'),
-          hooks: [{ type: 'command', command: `node ${JSON.stringify(hookPath)}`, timeout: 15 }],
+          hooks: [{ type: 'command', command: `node ${JSON.stringify(hookPath)} || exit 2`, timeout: 15 }],
         },
       ],
     },
