@@ -1,6 +1,7 @@
 import express, { type Request, type Response } from "express";
 import path from "node:path";
 import fs from "node:fs";
+import { randomBytes } from "node:crypto";
 import dotenv from "dotenv";
 import { GoogleGenAI } from "@google/genai";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
@@ -20,11 +21,13 @@ import {
   voiceViolations,
 } from "./src/commander/persona.js";
 import { Sentinel } from "./src/commander/sentinel.js";
+import { GENESIS } from "./src/commander/store.js";
 import { runVerifiers } from "./src/commander/verifiers.js";
 import {
   ActionRequestSchema,
   EvidenceSchema,
   StepDefSchema,
+  isWitnessSpec,
   type ActionRequest,
   type Principal,
   type StepDef,
@@ -53,6 +56,9 @@ const ai = new GoogleGenAI({
 
 const DEFAULT_GEMINI_MODEL = "gemini-3.8-flash";
 
+// Ephemeral per-process CSRF token for cockpit state-changing POST requests
+const sessionCsrfToken = randomBytes(24).toString("base64url");
+
 // Load COMMANDER_SOUL.md specification
 const COMMANDER_SOUL_PATH = path.resolve(process.cwd(), "COMMANDER_SOUL.md");
 const COMMANDER_SOUL_SPEC = fs.existsSync(COMMANDER_SOUL_PATH)
@@ -63,7 +69,6 @@ Never apologize. Only mechanical proof moves a step.`;
 
 /** Enforce COMMANDER_SOUL.md voice invariants on any generated dialogue text */
 function enforceCommanderVoice(raw: string): string {
-  // Replace exclamation marks with periods and strip emojis
   const stripped = raw
     .replace(/!/g, ".")
     .replace(/[\u{1F300}-\u{1F9FF}\u{2600}-\u{26FF}\u{2700}-\u{27BF}]/gu, "")
@@ -74,7 +79,7 @@ function enforceCommanderVoice(raw: string): string {
 }
 
 /* -------------------------------------------------------------------------- */
-/* AGENT COMMANDER CONTROL PLANE INITIALIZATION (AIRLOCK + SENTINEL + VERIFIER)*/
+/* AGENT COMMANDER CONTROL PLANE INITIALIZATION (AIRLOCK + SENTINEL + WITNESS)*/
 /* -------------------------------------------------------------------------- */
 
 const ADMIN_TOKEN = process.env.COMMANDER_ADMIN_TOKEN || "commander-sovereign-admin-token-2026";
@@ -83,6 +88,7 @@ const commanderConfig = {
     ...process.env,
     PORT: String(PORT),
     HOST: "0.0.0.0",
+    PUBLIC_URL: `http://localhost:${PORT}`,
   }),
   adminToken: ADMIN_TOKEN,
   geminiApiKey: geminiApiKey || undefined,
@@ -90,6 +96,14 @@ const commanderConfig = {
   policy: {
     ...defaultPolicy(),
     egress_allowlist: ["registry.example.com", "api.github.com", "*.npmjs.org"],
+  },
+  witness: {
+    mode: "local" as const,
+    root: process.cwd(),
+    allow: ["node", "ls", "cat", "head", "echo", "true"],
+    path: process.env.PATH || "/usr/local/bin:/usr/bin:/bin",
+    tenants: "*" as const,
+    concurrency: 2,
   },
 };
 
@@ -110,13 +124,20 @@ const DEFAULT_MISSION_DEF = {
   title: "Release 4.2 · Sovereign Production Cutover",
   steps: [
     {
-      title: "Run Mechanical Test Suite",
+      title: "Run Mechanical Test Suite & Witness Verification",
       directive:
-        "Execute full unit and integration test suite. Report real exit_code 0, raw test counts in stdout, and echo the active attempt nonce.",
+        "Execute full unit and integration test suite. Report real exit_code 0, raw test counts in stdout, echo the active attempt nonce, and pass independent LocalWitness inspection of package.json.",
       risk_tier: "routine" as const,
       max_attempts: 3,
       require_nonce: true,
       proof: [
+        {
+          type: "witness_file" as const,
+          path: "package.json",
+          min_bytes: 50,
+          regex: "orator-ai-forge",
+          flags: "",
+        },
         { type: "exit_code" as const, expected: 0 },
         { type: "regex" as const, target: "stdout", pattern: "\\d+ passed", flags: "", must_match: true },
         { type: "nonce_present" as const },
@@ -182,20 +203,37 @@ const DEFAULT_MISSION_DEF = {
   ],
 };
 
+type AirlockSphereState = "idle" | "running" | "staged" | "verified" | "quarantined";
+
+interface MissionLastEvent {
+  seq: number;
+  ts: string;
+  type: string;
+  summary: string;
+  sphere_state: AirlockSphereState;
+}
+
+const missionLastEvents = new Map<string, MissionLastEvent>();
+const sseClients = new Set<Response>();
+
 let activeMissionId = commander.airlock.openMission(defaultOperatorPrincipal, DEFAULT_MISSION_DEF).id;
 
-// Release step 1 directive and stage an initial high-impact clearance so the operator HUD cockpit
-// immediately has a live step, mechanical checklist, and a staged action ready for Authorize / Redirect / Kill
+// Release step 1 directive and stage an initial PreToolUse guard intercept so the HUD cockpit
+// immediately has a live step, witnessed + reported checklist, and a native intercept gate ready
 const bootDirective = commander.airlock.getDirective(defaultWorkerPrincipal, activeMissionId);
 if (bootDirective.state === "DIRECTIVE") {
-  void commander.airlock.requestClearance(defaultWorkerPrincipal, activeMissionId, {
-    lease_id: bootDirective.lease_id,
-    action: {
-      kind: "sql",
-      payload: "ALTER TABLE releases ADD COLUMN release_notes text;",
-      intent: "schema_change",
-    },
-  });
+  void commander.airlock
+    .requestGuardClearance(defaultWorkerPrincipal, activeMissionId, {
+      tool: "Bash/Write",
+      action: {
+        kind: "sql",
+        payload: "ALTER TABLE releases ADD COLUMN release_notes text;",
+        intent: "schema_change",
+      },
+    })
+    .then((c) => {
+      recordMissionEvent(activeMissionId, "clearance.staged", c.message, "staged");
+    });
 }
 
 function describeRequirementText(spec: VerifierSpec): string {
@@ -217,47 +255,212 @@ function describeRequirementText(spec: VerifierSpec): string {
     case "diff_policy":
       return `diff "${spec.artifact}" within policy`;
     case "witness_command":
-      return `witness exec: ${spec.argv.join(" ")}`;
+      return `LocalWitness exec: ${spec.argv.join(" ")}`;
     case "witness_file":
-      return `witness file: ${spec.path}`;
+      return `LocalWitness file: ${spec.path} (>=${spec.min_bytes}B)`;
   }
 }
 
-function buildCockpitSnapshot() {
-  const rawMission = commander.store.state.missions[activeMissionId];
-  const missionViewData = rawMission ? commander.airlock.getMission(defaultOperatorPrincipal, activeMissionId) : null;
+function computeMissionSphereState(missionId: string): AirlockSphereState {
+  const rawMission = commander.store.state.missions[missionId];
+  if (!rawMission) return "idle";
+
+  const currentStepRaw = rawMission.steps[rawMission.current];
+  const pendingForMission = commander.approvals
+    .list(defaultTenantId, "pending")
+    .filter((a) => a.missionId === missionId);
+  const tenantRec = commander.store.state.tenants[defaultTenantId];
+  const lastEvt = missionLastEvents.get(missionId);
+
+  if (
+    rawMission.status === "quarantined" ||
+    rawMission.status === "killed" ||
+    currentStepRaw?.status === "quarantined" ||
+    (tenantRec && tenantRec.credits <= 0) ||
+    lastEvt?.type === "clearance.denied"
+  ) {
+    return "quarantined";
+  }
+
+  if (rawMission.status === "paused" || Boolean(rawMission.pausedFor) || pendingForMission.length > 0) {
+    return "staged";
+  }
+
+  if (
+    rawMission.status === "completed" ||
+    currentStepRaw?.status === "passed" ||
+    lastEvt?.type === "proof.accepted"
+  ) {
+    return "verified";
+  }
+
+  const now = commander.clock();
+  if (
+    currentStepRaw &&
+    currentStepRaw.status === "released" &&
+    currentStepRaw.lease &&
+    !currentStepRaw.lease.revoked &&
+    currentStepRaw.lease.expiresAt > now
+  ) {
+    return "running";
+  }
+
+  return "idle";
+}
+
+function summarizeAuditEvent(
+  eventType: string,
+  missionId: string,
+  fallbackSummary?: string
+): string {
+  if (fallbackSummary && fallbackSummary.trim().length > 0) {
+    return fallbackSummary.trim();
+  }
+  const rawMission = commander.store.state.missions[missionId];
+  const step = rawMission?.steps[rawMission.current];
+  const stepIdx = (step?.index ?? 0) + 1;
+  const stepTotal = rawMission?.steps.length ?? 4;
+  const stepTitle = step?.def.title ?? "Current Step";
+
+  switch (eventType) {
+    case "mission.opened":
+      return `Airlock ready. Mission "${rawMission?.title ?? "Release 4.2"}" initialized — no active worker lease.`;
+    case "directive.issued":
+      return `Step ${stepIdx} of ${stepTotal} (${stepTitle}) running. Active worker lease issued — awaiting mechanical proof.`;
+    case "clearance.staged":
+    case "approval.staged":
+      return `Action staged on Step ${stepIdx} (${stepTitle}). Pending operator Authorize, Redirect, or Kill.`;
+    case "clearance.allowed":
+      return `Action cleared by Sentinel on Step ${stepIdx}. Worker lease active.`;
+    case "clearance.denied":
+      return `Action denied by Perimeter Sentinel. Policy boundary enforced.`;
+    case "proof.accepted":
+      return `Step ${stepIdx} mechanically verified (exit_code === 0). Step sealed in ledger.`;
+    case "proof.rejected":
+      return `Proof rejected on Step ${stepIdx}. Mechanical check failed — corrective patch attached.`;
+    case "step.quarantined":
+      return `Attempts exhausted on Step ${stepIdx} (${stepTitle}). Step quarantined — operator intervention required.`;
+    case "approval.decided":
+      return `Operator gate decided on Step ${stepIdx}. Mission state synchronized.`;
+    case "operator.redirect":
+      return `${ANCHOR} Step ${stepIdx} directive patched by operator.`;
+    case "mission.killed":
+      return `Mission terminated by operator. All worker leases revoked.`;
+    case "mission.completed":
+      return `All mission steps mechanically verified (exit_code === 0). Mission complete.`;
+    default:
+      return `Airlock state synchronized (${eventType}).`;
+  }
+}
+
+function recordMissionEvent(
+  missionId: string,
+  type: string,
+  explicitSummary?: string,
+  explicitSphereState?: AirlockSphereState
+): MissionLastEvent {
+  const latestAudit = commander.store.tenantAudit(defaultTenantId, 1)[0];
+  const seq = latestAudit?.seq ?? 1;
+  const ts = latestAudit?.ts ?? new Date(commander.clock()).toISOString();
+  const prevEvt = missionLastEvents.get(missionId);
+  // Provisionally store type so computeMissionSphereState sees the latest event type
+  missionLastEvents.set(missionId, {
+    seq,
+    ts,
+    type,
+    summary: explicitSummary || prevEvt?.summary || "",
+    sphere_state: explicitSphereState ?? "idle",
+  });
+  const sphereState = explicitSphereState ?? computeMissionSphereState(missionId);
+  const summary = summarizeAuditEvent(type, missionId, explicitSummary);
+  const evt: MissionLastEvent = {
+    seq,
+    ts,
+    type,
+    summary,
+    sphere_state: sphereState,
+  };
+  missionLastEvents.set(missionId, evt);
+  broadcastSse(type, missionId);
+  return evt;
+}
+
+function buildAuditVerificationPayload(tenantId: string = defaultTenantId) {
+  const verdict = commander.store.verify({ tenantId, full: true });
+  const records = commander.store.tenantAudit(tenantId, 15).map((r) => ({
+    seq: r.seq,
+    ts: r.ts,
+    type: r.type,
+    prev: r.prev,
+    hash: r.hash,
+    data: r.data,
+  }));
+  const headHash = records[0]?.hash ?? GENESIS;
+  return {
+    ok: verdict.ok,
+    count: verdict.ok ? verdict.count : 0,
+    brokenAt: !verdict.ok ? verdict.brokenAt : undefined,
+    reason: !verdict.ok ? verdict.reason : undefined,
+    headHash,
+    genesisHash: GENESIS,
+    records,
+  };
+}
+
+function buildLiveMissionPayload(missionId: string = activeMissionId) {
+  const rawMission =
+    commander.store.state.missions[missionId] ??
+    commander.store.state.missions[activeMissionId];
+  const resolvedId = rawMission?.id ?? missionId;
+  const missionViewData = rawMission
+    ? commander.airlock.getMission(defaultOperatorPrincipal, resolvedId)
+    : null;
   const currentStepRaw = rawMission ? rawMission.steps[rawMission.current] : undefined;
 
-  const pendingApprovals = commander.approvals.list(defaultTenantId, "pending").map((a) => {
-    const m = commander.store.state.missions[a.missionId];
-    const s = m?.steps.find((st) => st.id === a.stepId);
-    return {
-      id: a.id,
-      kind: a.kind,
-      status: a.status,
-      incident: a.incident,
-      reason: a.reason,
-      created_at: a.createdAt,
-      mission_id: a.missionId,
-      mission: m?.title ?? "Mission",
-      step_id: a.stepId,
-      step: s?.def.title ?? "Step",
-      clearance_id: a.clearanceId,
-      voice: VOICE_PROFILE,
-    };
-  });
+  // Active pending approvals dynamically filtered for this tenant
+  const pendingApprovals = commander.approvals
+    .list(defaultTenantId, "pending")
+    .map((a) => {
+      const m = commander.store.state.missions[a.missionId];
+      const s = m?.steps.find((st) => st.id === a.stepId);
+      const clearance = a.clearanceId ? commander.store.state.clearances[a.clearanceId] : undefined;
+      const source = clearance?.source ?? (a.incident.startsWith("NATIVE ") ? "guard" : "mcp");
+      const toolMatch = /^NATIVE\s+([^:]+):/i.exec(a.incident);
+      const tool = toolMatch?.[1] ?? (source === "guard" ? "Bash/Write" : undefined);
+      const signedLinks = commander.approvals.links(a.id);
 
-  const allApprovals = commander.approvals.list(defaultTenantId).slice(0, 10);
+      return {
+        id: a.id,
+        kind: a.kind,
+        status: a.status,
+        incident: a.incident,
+        reason: a.reason,
+        created_at: a.createdAt,
+        mission_id: a.missionId,
+        mission: m?.title ?? "Mission",
+        step_id: a.stepId,
+        step: s?.def.title ?? "Step",
+        clearance_id: a.clearanceId,
+        source,
+        tool,
+        provenance: source === "guard" ? ("native_intercept" as const) : ("reported" as const),
+        signed_links: signedLinks,
+        voice: VOICE_PROFILE,
+      };
+    });
 
-  // Build mechanical checklist for the current step
+  // Build mechanical checklist for the current step with explicit [WITNESSED] vs [REPORTED] provenance
   const lastAttempt = currentStepRaw?.attempts.at(-1);
   const checklist = currentStepRaw
     ? currentStepRaw.def.proof.map((spec, idx) => {
         const lastResult = lastAttempt?.results[idx];
+        const witnessed = isWitnessSpec(spec);
         const kindLabel = spec.hidden ? "hidden_invariant" : spec.type;
         const reqText = spec.hidden
           ? "Hidden mechanical invariant (undisclosed to worker)"
           : describeRequirementText(spec);
+        const provenance = witnessed ? ("witnessed" as const) : ("reported" as const);
+        const badgeText = witnessed ? "[WITNESSED]" : "[REPORTED]";
         return {
           index: idx + 1,
           type: kindLabel,
@@ -266,45 +469,83 @@ function buildCockpitSnapshot() {
           requirement: reqText,
           label: `${kindLabel.toUpperCase()} · ${reqText}`,
           detail: lastResult?.reason ?? reqText,
-          status: lastResult ? (lastResult.ok ? "passed" : "failed") : "pending",
+          status: lastResult ? (lastResult.ok ? ("passed" as const) : ("failed" as const)) : ("pending" as const),
           reason: lastResult?.reason ?? null,
+          provenance,
+          badgeText,
         };
       })
     : [];
 
-  // Determine Airlock lifecycle visual state for the 3D neural sphere
-  let sphereState: "idle" | "running" | "staged" | "verified" | "quarantined" = "idle";
-  if (rawMission) {
-    if (rawMission.status === "quarantined" || rawMission.status === "killed" || currentStepRaw?.status === "quarantined") {
-      sphereState = "quarantined";
-    } else if (rawMission.status === "paused" || pendingApprovals.length > 0) {
-      sphereState = "staged";
-    } else if (rawMission.status === "completed" || currentStepRaw?.status === "passed") {
-      sphereState = "verified";
-    } else if (currentStepRaw?.status === "released") {
-      sphereState = "running";
-    } else {
-      sphereState = "idle";
-    }
-  }
+  const sphereState = computeMissionSphereState(resolvedId);
+  const latestAudit = commander.store.tenantAudit(defaultTenantId, 1)[0];
+  const lastEvent: MissionLastEvent = missionLastEvents.get(resolvedId) ?? {
+    seq: latestAudit?.seq ?? 1,
+    ts: latestAudit?.ts ?? new Date(commander.clock()).toISOString(),
+    type: latestAudit?.type ?? "mission.opened",
+    summary: summarizeAuditEvent(latestAudit?.type ?? "mission.opened", resolvedId),
+    sphere_state: sphereState,
+  };
+  lastEvent.sphere_state = sphereState;
 
   const tenantRec = commander.store.state.tenants[defaultTenantId];
   const rawMetrics = computeMetrics(commander.store, defaultTenantId, commander.clock());
-  const auditVerification = commander.store.verify({ tenantId: defaultTenantId });
-  const auditTail = commander.store
-    .tenantAudit(defaultTenantId, 20)
-    .map((r) => ({ seq: r.seq, ts: r.ts, type: r.type, kind: r.type, data: r.data, hash: r.hash.slice(0, 12) }));
+  const auditVerification = commander.store.verify({ tenantId: defaultTenantId, full: true });
 
   return {
-    sphereState,
+    id: resolvedId,
+    title: rawMission?.title ?? "Release 4.2 · Sovereign Production Cutover",
+    status: rawMission?.status ?? "active",
+    current_index: rawMission?.current ?? 0,
+    step_count: rawMission?.steps.length ?? 0,
+    created_at: rawMission?.createdAt ?? new Date(commander.clock()).toISOString(),
+    updated_at: rawMission?.updatedAt ?? new Date(commander.clock()).toISOString(),
+    paused_for: rawMission?.pausedFor,
+    ledger: rawMission?.manifests ?? [],
+    last_event: lastEvent,
+    sphere_state: sphereState,
+    current_step: currentStepRaw
+      ? {
+          id: currentStepRaw.id,
+          index: currentStepRaw.index + 1,
+          total_steps: rawMission!.steps.length,
+          title: currentStepRaw.def.title,
+          directive: currentStepRaw.operatorPatch
+            ? `${currentStepRaw.def.directive}\n\nOPERATOR REDIRECT: ${say.redirected(currentStepRaw.operatorPatch)}`
+            : currentStepRaw.def.directive,
+          status: currentStepRaw.status,
+          risk_tier: currentStepRaw.def.risk_tier,
+          attempt: Math.min(currentStepRaw.attempts.length + 1, currentStepRaw.attemptBudget),
+          attempt_budget: currentStepRaw.attemptBudget,
+          nonce: currentStepRaw.nonce ?? null,
+          lease_id: currentStepRaw.lease?.id ?? null,
+          lease_expires_at:
+            currentStepRaw.lease && !currentStepRaw.lease.revoked
+              ? new Date(currentStepRaw.lease.expiresAt).toISOString()
+              : null,
+          lease_revoked: currentStepRaw.lease?.revoked ?? false,
+          operator_patch: currentStepRaw.operatorPatch ?? null,
+          checklist,
+        }
+      : null,
+    steps: (rawMission?.steps ?? []).map((st, idx) => ({
+      id: st.id,
+      idx: idx + 1,
+      index: idx + 1,
+      title: st.def.title,
+      status: st.status,
+      risk_tier: st.def.risk_tier,
+      attempt: st.attempts.length,
+      attempt_budget: st.attemptBudget,
+    })),
+    approvals: pendingApprovals,
+    // Secrets (operatorKey, workerKey) are strictly omitted from client payloads
     tenant: {
       id: defaultTenantId,
       name: tenantRec?.name ?? "Sovereign Operations",
       credits: tenantRec?.credits ?? 0,
       creditBalance: tenantRec?.credits ?? 0,
       status: (tenantRec?.credits ?? 0) > 0 ? ("online" as const) : ("depleted" as const),
-      operatorKey: defaultOperatorKey,
-      workerKey: defaultWorkerKey,
       auditVerified: auditVerification.ok,
       auditCount: auditVerification.ok ? auditVerification.count : 0,
     },
@@ -314,58 +555,64 @@ function buildCockpitSnapshot() {
       burnRatePerHour: rawMetrics.spend.creditsLastHour,
       tokensSaved: rawMetrics.spend.tokensSaved,
       errorVelocityPerMin: rawMetrics.errorVelocity.perMinute,
-      totalEvents: auditVerification.ok ? auditVerification.count : auditTail.length,
+      pendingApprovals: pendingApprovals.length,
+      stagedApprovals: pendingApprovals.length,
+      totalEvents: auditVerification.ok ? auditVerification.count : 0,
     },
-    mission: missionViewData
-      ? {
-          ...missionViewData,
-          step_count: rawMission!.steps.length,
-          steps: rawMission!.steps.map((st, idx) => ({
-            id: st.id,
-            idx: idx + 1,
-            index: idx + 1,
-            title: st.def.title,
-            status: st.status,
-            risk_tier: st.def.risk_tier,
-            attempt: st.attempts.length,
-            attempt_budget: st.attemptBudget,
-          })),
-          current_step: currentStepRaw
-            ? {
-                id: currentStepRaw.id,
-                index: currentStepRaw.index + 1,
-                total_steps: rawMission!.steps.length,
-                title: currentStepRaw.def.title,
-                directive: currentStepRaw.operatorPatch
-                  ? `${currentStepRaw.def.directive}\n\nOPERATOR REDIRECT: ${say.redirected(currentStepRaw.operatorPatch)}`
-                  : currentStepRaw.def.directive,
-                status: currentStepRaw.status,
-                risk_tier: currentStepRaw.def.risk_tier,
-                attempt: Math.min(currentStepRaw.attempts.length + 1, currentStepRaw.attemptBudget),
-                attempt_budget: currentStepRaw.attemptBudget,
-                nonce: currentStepRaw.nonce ?? null,
-                lease_id: currentStepRaw.lease?.id ?? null,
-                lease_expires_at: currentStepRaw.lease ? new Date(currentStepRaw.lease.expiresAt).toISOString() : null,
-                lease_revoked: currentStepRaw.lease?.revoked ?? false,
-                operator_patch: currentStepRaw.operatorPatch ?? null,
-                checklist,
-              }
-            : null,
-        }
-      : null,
-    approvals: pendingApprovals,
+    mission_view: missionViewData,
+    csrf_token: sessionCsrfToken,
+  };
+}
+
+function buildCockpitSnapshot() {
+  const liveMission = buildLiveMissionPayload(activeMissionId);
+  const auditVerify = buildAuditVerificationPayload(defaultTenantId);
+  const allApprovals = commander.approvals.list(defaultTenantId).slice(0, 10);
+
+  return {
+    sphereState: liveMission.sphere_state,
+    tenant: liveMission.tenant,
+    metrics: liveMission.metrics,
+    mission: liveMission,
+    approvals: liveMission.approvals,
     recentApprovals: allApprovals,
     audit: {
-      valid: auditVerification.ok,
-      entries: auditVerification.ok ? auditVerification.count : auditTail.length,
-      tail: auditTail,
+      valid: auditVerify.ok,
+      entries: auditVerify.count,
+      tail: auditVerify.records.map((r) => ({
+        seq: r.seq,
+        ts: r.ts,
+        type: r.type,
+        kind: r.type,
+        data: r.data,
+        hash: r.hash.slice(0, 12),
+      })),
     },
     persona: {
       anchor: ANCHOR,
       name: "COMMANDER_SOUL",
       voiceProfile: VOICE_PROFILE,
     },
+    csrf_token: sessionCsrfToken,
   };
+}
+
+function broadcastSse(eventType: string, missionId: string = activeMissionId) {
+  if (sseClients.size === 0) return;
+  const payload = JSON.stringify({
+    type: eventType,
+    ts: new Date(commander.clock()).toISOString(),
+    missionId,
+    mission: buildLiveMissionPayload(missionId),
+    audit: buildAuditVerificationPayload(defaultTenantId),
+  });
+  for (const client of sseClients) {
+    try {
+      client.write(`data: ${payload}\n\n`);
+    } catch {
+      sseClients.delete(client);
+    }
+  }
 }
 
 /** Resolve principal from Authorization header or fall back to default principal for seamless cockpit operation */
@@ -375,6 +622,13 @@ function resolvePrincipal(req: Request, fallbackRole: "operator" | "worker" = "o
     return commander.auth.authenticate(authHeader);
   }
   return fallbackRole === "operator" ? defaultOperatorPrincipal : defaultWorkerPrincipal;
+}
+
+function verifyCockpitCsrf(req: Request): void {
+  const token = req.headers["x-csrf-token"];
+  if (!token || token !== sessionCsrfToken) {
+    throw new CommanderError("FORBIDDEN", say.forbidden());
+  }
 }
 
 function handleCommanderError(err: unknown, res: Response) {
@@ -393,14 +647,81 @@ function handleCommanderError(err: unknown, res: Response) {
 }
 
 /* -------------------------------------------------------------------------- */
-/* AGENT COMMANDER V1 ROUTES (AIRLOCK, SENTINEL, VERIFIERS, MCP, APPROVALS)   */
+/* AGENT COMMANDER V1 ROUTES (LIVE MISSIONS, SSE EVENTS, AUDIT, AIRLOCK)      */
 /* -------------------------------------------------------------------------- */
 
 app.get("/healthz", (_req, res) => {
   res.json({ ok: true, service: "orator-agent-commander", model: DEFAULT_GEMINI_MODEL });
 });
 
-// Signed approval links (/a/:id and /a/:id/decide)
+// Live SSE Event Stream (/v1/events)
+app.get("/v1/events", (req, res) => {
+  res.setHeader("Content-Type", "text/event-stream");
+  res.setHeader("Cache-Control", "no-cache, no-transform");
+  res.setHeader("Connection", "keep-alive");
+  res.flushHeaders?.();
+
+  sseClients.add(res);
+
+  const initialPayload = JSON.stringify({
+    type: "mission.snapshot",
+    ts: new Date(commander.clock()).toISOString(),
+    missionId: activeMissionId,
+    mission: buildLiveMissionPayload(activeMissionId),
+    audit: buildAuditVerificationPayload(defaultTenantId),
+  });
+  res.write(`data: ${initialPayload}\n\n`);
+
+  const heartbeat = setInterval(() => {
+    try {
+      res.write(`: heartbeat ${Date.now()}\n\n`);
+    } catch {
+      clearInterval(heartbeat);
+      sseClients.delete(res);
+    }
+  }, 15_000);
+
+  req.on("close", () => {
+    clearInterval(heartbeat);
+    sseClients.delete(res);
+  });
+});
+
+// Live Missions Endpoints (/v1/missions and /v1/missions/:id)
+app.get("/v1/missions", (req, res) => {
+  try {
+    const principal = resolvePrincipal(req, "operator");
+    res.json({
+      active_mission_id: activeMissionId,
+      missions: commander.airlock.listMissions(principal),
+    });
+  } catch (err) {
+    handleCommanderError(err, res);
+  }
+});
+
+app.get("/v1/missions/:id", (req, res) => {
+  try {
+    const requestedId = req.params.id === "active" ? activeMissionId : req.params.id!;
+    if (!Object.hasOwn(commander.store.state.missions, requestedId)) {
+      throw new CommanderError("NOT_FOUND", say.notFound());
+    }
+    res.json(buildLiveMissionPayload(requestedId));
+  } catch (err) {
+    handleCommanderError(err, res);
+  }
+});
+
+// Cryptographic Audit Verification Endpoint (/v1/audit/verify)
+app.get("/v1/audit/verify", (_req, res) => {
+  try {
+    res.json(buildAuditVerificationPayload(defaultTenantId));
+  } catch (err) {
+    handleCommanderError(err, res);
+  }
+});
+
+// Signed single-use approval capability links (/a/:id and /a/:id/decide)
 app.get("/a/:id", (req, res) => {
   try {
     const id = req.params.id!;
@@ -436,8 +757,38 @@ app.post("/a/:id/decide", (req, res) => {
     }
     const note = typeof req.body?.note === "string" ? req.body.note : undefined;
     const a = commander.approvals.byId(id);
+    // decideApproval enforces single-use (throws CONFLICT if status !== 'pending')
     const decided = commander.airlock.decideApproval(a.tenantId, id, decision, note, "link");
-    res.json({ ok: true, status: decided.status });
+
+    // Re-issue directive lease if a quarantined step was re-opened
+    const m = commander.store.state.missions[a.missionId];
+    if (m && m.status === "active" && decision !== "kill") {
+      const s = m.steps[m.current];
+      if (s && !s.lease) {
+        commander.airlock.getDirective(defaultWorkerPrincipal, a.missionId);
+      }
+    }
+
+    const voiceMessage =
+      decision === "authorize"
+        ? say.authorized()
+        : decision === "redirect"
+        ? say.redirected(note || "Re-plan approach and satisfy mechanical verifiers.")
+        : say.killed();
+
+    recordMissionEvent(
+      a.missionId,
+      "approval.decided",
+      voiceMessage,
+      decision === "kill" ? "quarantined" : "running"
+    );
+
+    res.json({
+      ok: true,
+      status: decided.status,
+      message: voiceMessage,
+      mission: buildLiveMissionPayload(a.missionId),
+    });
   } catch (err) {
     handleCommanderError(err, res);
   }
@@ -471,7 +822,7 @@ app.post("/v1/admin/tenants/:id/credits", (req, res) => {
   }
 });
 
-// Guard clearance endpoint
+// Guard clearance endpoint (PreToolUse Native Intercept)
 app.post("/v1/guard/clearance", async (req, res) => {
   try {
     const principal = resolvePrincipal(req, "worker");
@@ -486,6 +837,15 @@ app.post("/v1/guard/clearance", async (req, res) => {
       action: body.action,
       tool: body.tool,
     });
+    recordMissionEvent(
+      body.mission_id,
+      result.verdict === "STAGED"
+        ? "clearance.staged"
+        : result.verdict === "DENIED"
+        ? "clearance.denied"
+        : "clearance.allowed",
+      result.message
+    );
     res.json(result);
   } catch (err) {
     handleCommanderError(err, res);
@@ -507,6 +867,7 @@ app.post("/v1/mcp", async (req, res) => {
     });
     await server.connect(transport);
     await transport.handleRequest(req, res, req.body);
+    broadcastSse("mcp.request", activeMissionId);
   } catch (err) {
     handleCommanderError(err, res);
   }
@@ -554,6 +915,7 @@ app.post("/v1/operator/missions", (req, res) => {
     const principal = resolvePrincipal(req, "operator");
     const created = commander.airlock.openMission(principal, req.body);
     activeMissionId = created.id;
+    recordMissionEvent(activeMissionId, "mission.opened", undefined, "idle");
     res.status(201).json(created);
   } catch (err) {
     handleCommanderError(err, res);
@@ -573,7 +935,13 @@ app.post("/v1/operator/missions/:id/intervene", (req, res) => {
   try {
     const principal = resolvePrincipal(req, "operator");
     const body = z.object({ action: z.enum(["kill", "skip"]), reason: z.string().min(1).max(300) }).parse(req.body);
-    res.json(commander.airlock.intervene(principal, req.params.id!, body));
+    const updated = commander.airlock.intervene(principal, req.params.id!, body);
+    recordMissionEvent(
+      req.params.id!,
+      body.action === "kill" ? "mission.killed" : "step.skipped",
+      body.action === "kill" ? say.killed() : `Step skipped by operator: ${body.reason}`
+    );
+    res.json(updated);
   } catch (err) {
     handleCommanderError(err, res);
   }
@@ -607,6 +975,15 @@ app.post("/v1/operator/approvals/:id/decision", (req, res) => {
       body.decision,
       body.note,
       "operator"
+    );
+    recordMissionEvent(
+      decided.missionId,
+      "approval.decided",
+      body.decision === "authorize"
+        ? say.authorized()
+        : body.decision === "redirect"
+        ? say.redirected(body.note || "Operator redirect.")
+        : say.killed()
     );
     res.json(decided);
   } catch (err) {
@@ -670,6 +1047,7 @@ app.get("/api/commander/overview", (_req, res) => {
 // 2. Pull / Release Directive in Airlock
 app.post("/api/commander/airlock/directive", (req, res) => {
   try {
+    verifyCockpitCsrf(req);
     const missionId = req.body?.mission_id || activeMissionId;
     let rawMission = commander.store.state.missions[missionId];
     if (!rawMission || rawMission.status === "completed" || rawMission.status === "killed") {
@@ -684,6 +1062,7 @@ app.post("/api/commander/airlock/directive", (req, res) => {
         }
       }
       rawMission.status = "active";
+      rawMission.pausedFor = undefined;
       const curStep = rawMission.steps[rawMission.current];
       if (curStep && curStep.status === "quarantined") {
         curStep.status = "released";
@@ -691,9 +1070,12 @@ app.post("/api/commander/airlock/directive", (req, res) => {
       }
     }
     const directive = commander.airlock.getDirective(defaultWorkerPrincipal, rawMission.id);
+    recordMissionEvent(rawMission.id, "directive.issued", directive.message, "running");
+
     res.json({
       directive,
-      message: directive.voice,
+      message: directive.message,
+      mission: buildLiveMissionPayload(rawMission.id),
       cockpit: buildCockpitSnapshot(),
     });
   } catch (err) {
@@ -701,9 +1083,10 @@ app.post("/api/commander/airlock/directive", (req, res) => {
   }
 });
 
-// 3. Submit Mechanical Proof to Airlock & Verifiers
+// 3. Submit Mechanical Proof to Airlock & Verifiers (including LocalWitness)
 app.post("/api/commander/airlock/proof", async (req, res) => {
   try {
+    verifyCockpitCsrf(req);
     const missionId = req.body?.mission_id || activeMissionId;
     let rawMission = commander.store.state.missions[missionId];
     if (!rawMission || rawMission.status === "completed" || rawMission.status === "killed") {
@@ -721,6 +1104,7 @@ app.post("/api/commander/airlock/proof", async (req, res) => {
         }
       }
       rawMission.status = "active";
+      rawMission.pausedFor = undefined;
       const curStep = rawMission.steps[rawMission.current];
       if (curStep && curStep.status === "quarantined") {
         curStep.status = "released";
@@ -728,7 +1112,6 @@ app.post("/api/commander/airlock/proof", async (req, res) => {
       }
     }
 
-    // Ensure current step has an active lease before submitting proof
     const currentStep = rawMission.steps[rawMission.current];
     if (currentStep && (currentStep.status === "locked" || !currentStep.lease || currentStep.lease.revoked)) {
       commander.airlock.getDirective(defaultWorkerPrincipal, rawMission.id);
@@ -738,20 +1121,19 @@ app.post("/api/commander/airlock/proof", async (req, res) => {
     const stepIdx = rawMission.current;
     const stepNonce = rawMission.steps[stepIdx]?.nonce;
 
-    // Build default valid evidence for the current step if caller passed { simulateFailure } or { preset }
     let evidence = req.body?.evidence;
     if (!evidence) {
       if (req.body?.preset === "fail" || req.body?.simulateFailure === true) {
         evidence = {
           exit_code: 1,
-          stdout: "Test suite failed: 2 assertions broken",
+          stdout: `Test suite failed at ${Date.now()}: 2 assertions broken`,
           claim: "All checks completed.",
         };
       } else {
         if (stepIdx === 0) {
           evidence = {
             exit_code: 0,
-            stdout: `148 passed, 0 failed\nverified-nonce: ${stepNonce ?? "nonce_ok"}`,
+            stdout: `654 passed, 0 failed\nverified-nonce: ${stepNonce ?? "nonce_ok"}`,
           };
         } else if (stepIdx === 1) {
           evidence = {
@@ -780,9 +1162,12 @@ app.post("/api/commander/airlock/proof", async (req, res) => {
       evidence,
     });
 
-    const snapshot = buildCockpitSnapshot();
     if (result.verdict === "PASSED") {
-      snapshot.sphereState = "verified";
+      recordMissionEvent(rawMission.id, "proof.accepted", result.message, "verified");
+    } else if (result.verdict === "QUARANTINED") {
+      recordMissionEvent(rawMission.id, "step.quarantined", result.message, "quarantined");
+    } else {
+      recordMissionEvent(rawMission.id, "proof.rejected", result.message, "running");
     }
 
     res.json({
@@ -790,17 +1175,19 @@ app.post("/api/commander/airlock/proof", async (req, res) => {
         ...result,
         status: result.verdict === "PASSED" ? "passed" : "failed",
       },
-      message: result.voice,
-      cockpit: snapshot,
+      message: result.message,
+      mission: buildLiveMissionPayload(rawMission.id),
+      cockpit: buildCockpitSnapshot(),
     });
   } catch (err) {
     handleCommanderError(err, res);
   }
 });
 
-// 4. Request Action Clearance through Sentinel & Airlock
+// 4. Request Action Clearance through Sentinel & Airlock (supports MCP or Native Guard Intercept)
 app.post("/api/commander/airlock/clearance", async (req, res) => {
   try {
+    verifyCockpitCsrf(req);
     const missionId = req.body?.mission_id || activeMissionId;
     let rawMission = commander.store.state.missions[missionId];
     if (!rawMission || rawMission.status === "completed" || rawMission.status === "killed") {
@@ -815,6 +1202,7 @@ app.post("/api/commander/airlock/clearance", async (req, res) => {
         }
       }
       rawMission.status = "active";
+      rawMission.pausedFor = undefined;
       const curStep = rawMission.steps[rawMission.current];
       if (curStep && curStep.status === "quarantined") {
         curStep.status = "released";
@@ -822,7 +1210,6 @@ app.post("/api/commander/airlock/clearance", async (req, res) => {
       }
     }
 
-    // Ensure step is released with a valid lease
     const currentStep = rawMission.steps[rawMission.current];
     if (currentStep && (currentStep.status === "locked" || !currentStep.lease || currentStep.lease.revoked)) {
       commander.airlock.getDirective(defaultWorkerPrincipal, rawMission.id);
@@ -837,14 +1224,36 @@ app.post("/api/commander/airlock/clearance", async (req, res) => {
           intent: req.body?.category || "schema_change",
         };
 
-    const result = await commander.airlock.requestClearance(defaultWorkerPrincipal, rawMission.id, {
-      lease_id: leaseId,
-      action,
-    });
+    const isGuard = req.body?.source === "guard" || Boolean(req.body?.tool);
+    const result = isGuard
+      ? await commander.airlock.requestGuardClearance(defaultWorkerPrincipal, rawMission.id, {
+          action,
+          tool: req.body?.tool || "Bash/Write",
+        })
+      : await commander.airlock.requestClearance(defaultWorkerPrincipal, rawMission.id, {
+          lease_id: leaseId,
+          action,
+        });
+
+    recordMissionEvent(
+      rawMission.id,
+      result.verdict === "STAGED"
+        ? "clearance.staged"
+        : result.verdict === "DENIED"
+        ? "clearance.denied"
+        : "clearance.allowed",
+      result.message,
+      result.verdict === "STAGED"
+        ? "staged"
+        : result.verdict === "DENIED"
+        ? "quarantined"
+        : "running"
+    );
 
     res.json({
       clearance: result,
-      message: result.voice,
+      message: result.message,
+      mission: buildLiveMissionPayload(rawMission.id),
       cockpit: buildCockpitSnapshot(),
     });
   } catch (err) {
@@ -855,11 +1264,11 @@ app.post("/api/commander/airlock/clearance", async (req, res) => {
 // 5. Trigger Quarantine / Block directly for testing or step containment
 app.post("/api/commander/airlock/quarantine", async (req, res) => {
   try {
+    verifyCockpitCsrf(req);
     const missionId = req.body?.mission_id || activeMissionId;
     const rawMission = commander.store.state.missions[missionId];
     if (!rawMission) throw new CommanderError("NOT_FOUND", say.notFound());
 
-    // If mission is paused, settle approval first so we can quarantine the current step
     if (rawMission.status === "paused" && rawMission.pausedFor) {
       const pending = commander.store.state.approvals[rawMission.pausedFor];
       if (pending && pending.status === "pending") {
@@ -874,7 +1283,6 @@ app.post("/api/commander/airlock/quarantine", async (req, res) => {
       commander.airlock.getDirective(defaultWorkerPrincipal, missionId);
     }
 
-    // Exhaust remaining attempts with failing evidence so Airlock mechanically quarantines the step
     let lastProof;
     let safety = 10;
     while (rawMission.status === "active" && step.status === "released" && safety-- > 0) {
@@ -882,16 +1290,19 @@ app.post("/api/commander/airlock/quarantine", async (req, res) => {
         lease_id: step.lease!.id,
         evidence: {
           exit_code: 1,
-          stdout: `FATAL: mechanical invariant check failed (${safety})`,
+          stdout: `FATAL: mechanical invariant check failed (${Date.now()}-${safety})`,
           claim: "Worker claims success despite exit 1",
         },
       });
       if (lastProof.verdict === "QUARANTINED") break;
     }
 
+    recordMissionEvent(missionId, "step.quarantined", say.quarantined(), "quarantined");
+
     res.json({
       proof: lastProof,
       message: say.quarantined(),
+      mission: buildLiveMissionPayload(missionId),
       cockpit: buildCockpitSnapshot(),
     });
   } catch (err) {
@@ -899,9 +1310,10 @@ app.post("/api/commander/airlock/quarantine", async (req, res) => {
   }
 });
 
-// 6. One-Tap Operator Decision (Authorize / Redirect / Kill)
+// 6. One-Tap Operator Decision (Authorize / Redirect / Kill) — CSRF protected
 app.post("/api/commander/decision", (req, res) => {
   try {
+    verifyCockpitCsrf(req);
     const body = z
       .object({
         approval_id: z.string().optional(),
@@ -931,7 +1343,6 @@ app.post("/api/commander/decision", (req, res) => {
           ? say.redirected(body.note || "Re-plan approach and satisfy mechanical verifiers.")
           : say.killed();
 
-      // If a quarantined step was re-opened, automatically issue a fresh directive lease
       const m = commander.store.state.missions[activeMissionId];
       if (m && m.status === "active" && body.decision !== "kill") {
         const s = m.steps[m.current];
@@ -940,7 +1351,6 @@ app.post("/api/commander/decision", (req, res) => {
         }
       }
     } else {
-      // No pending approval card: apply operator decision directly to the active mission/step
       const m = commander.store.state.missions[activeMissionId];
       if (!m) throw new CommanderError("NOT_FOUND", say.notFound());
 
@@ -957,6 +1367,7 @@ app.post("/api/commander/decision", (req, res) => {
           step.operatorPatch = cleanNote;
           if (m.status === "quarantined" || m.status === "paused") {
             m.status = "active";
+            m.pausedFor = undefined;
             step.status = "released";
             step.attemptBudget += step.def.max_attempts;
           }
@@ -972,10 +1383,10 @@ app.post("/api/commander/decision", (req, res) => {
         }
         voiceMessage = say.redirected(cleanNote);
       } else {
-        // Authorize: ensure mission is active and step directive is released
         const step = m.steps[m.current];
         if (step && (m.status === "quarantined" || m.status === "paused")) {
           m.status = "active";
+          m.pausedFor = undefined;
           step.status = "released";
           step.attemptBudget += step.def.max_attempts;
         }
@@ -984,12 +1395,20 @@ app.post("/api/commander/decision", (req, res) => {
       }
     }
 
+    recordMissionEvent(
+      activeMissionId,
+      body.decision === "redirect" ? "operator.redirect" : "approval.decided",
+      voiceMessage,
+      body.decision === "kill" ? "quarantined" : "running"
+    );
+
     res.json({
       ok: true,
       decision: body.decision,
       approval: decidedApproval,
       message: voiceMessage,
       voice: VOICE_PROFILE,
+      mission: buildLiveMissionPayload(activeMissionId),
       cockpit: buildCockpitSnapshot(),
     });
   } catch (err) {
@@ -1000,31 +1419,44 @@ app.post("/api/commander/decision", (req, res) => {
 // 7. Reset / Re-open Mission in Airlock
 app.post("/api/commander/reset", async (req, res) => {
   try {
+    verifyCockpitCsrf(req);
     const mode = req.body?.mode as "idle" | "running" | "staged" | undefined;
     const stageInitial = Boolean(req.body?.stageInitial) || mode === "staged";
     const created = commander.airlock.openMission(defaultOperatorPrincipal, DEFAULT_MISSION_DEF);
     activeMissionId = created.id;
 
-    let message = "Airlock reset to idle. Step 1 of 4 standing by.";
+    let message = "Airlock ready. No active worker lease allocated.";
+    let targetSphere: AirlockSphereState = "idle";
+
     if (mode === "running" || stageInitial) {
       const d = commander.airlock.getDirective(defaultWorkerPrincipal, activeMissionId);
-      message = d.voice;
+      message = d.message;
+      targetSphere = "running";
       if (stageInitial && d.state === "DIRECTIVE") {
-        const c = await commander.airlock.requestClearance(defaultWorkerPrincipal, activeMissionId, {
-          lease_id: d.lease_id,
+        const c = await commander.airlock.requestGuardClearance(defaultWorkerPrincipal, activeMissionId, {
+          tool: "Bash/Write",
           action: {
             kind: "sql",
             payload: "ALTER TABLE releases ADD COLUMN release_notes text;",
             intent: "schema_change",
           },
         });
-        message = c.voice;
+        message = c.message;
+        targetSphere = "staged";
       }
     }
+
+    recordMissionEvent(
+      activeMissionId,
+      stageInitial ? "clearance.staged" : mode === "running" ? "directive.issued" : "mission.opened",
+      message,
+      targetSphere
+    );
 
     res.json({
       ok: true,
       message,
+      mission: buildLiveMissionPayload(activeMissionId),
       cockpit: buildCockpitSnapshot(),
     });
   } catch (err) {
@@ -1079,7 +1511,7 @@ app.post(["/api/commander/verifiers/run", "/v1/verifiers/verify"], (req, res) =>
     const stepDef: StepDef = req.body?.step
       ? StepDefSchema.parse(req.body.step)
       : currentStep?.def ?? DEFAULT_MISSION_DEF.steps[0]!;
-    const evidence = EvidenceSchema.parse(req.body?.evidence ?? { exit_code: 0, stdout: "148 passed" });
+    const evidence = EvidenceSchema.parse(req.body?.evidence ?? { exit_code: 0, stdout: "654 passed" });
     const nonce = req.body?.nonce ?? currentStep?.nonce;
 
     const results = runVerifiers(stepDef, {
@@ -1104,7 +1536,6 @@ app.post(["/api/commander/verifiers/run", "/v1/verifiers/verify"], (req, res) =>
 /* API ROUTES: GEMINI PROJECT INTEGRATION & COMMANDER_SOUL DIALOGUE ENGINE    */
 /* -------------------------------------------------------------------------- */
 
-// 1. Health & Connection Status
 app.get("/api/gemini/status", (_req, res) => {
   res.json({
     status: "online",
@@ -1117,13 +1548,13 @@ app.get("/api/gemini/status", (_req, res) => {
       "step-gated-airlock",
       "perimeter-sentinel",
       "mechanical-verifiers",
+      "local-witness-runner",
       "commander-soul-persona",
     ],
     timestamp: Date.now(),
   });
 });
 
-// 2. Direct Content Generation
 app.post("/api/gemini/generate", async (req, res) => {
   const { prompt, systemInstruction } = req.body;
 
@@ -1167,55 +1598,73 @@ app.post("/api/gemini/generate", async (req, res) => {
   }
 });
 
-// 2b. Dialogue Engine wired to COMMANDER_SOUL.md Persona
+// Read-Only Ledger Query Dialogue Engine wired to COMMANDER_SOUL.md Persona
+// Security Hardening: Voice/chat inputs are strictly restricted to querying the ledger;
+// Authorize, Redirect, and Kill cannot be triggered from voice or chat.
 app.post(["/api/orator/chat", "/api/commander/chat"], async (req, res) => {
-  const { messages, userMessage, systemPrompt } = req.body;
-  const userText =
-    userMessage || (Array.isArray(messages) && messages[messages.length - 1]?.text) || "";
+  const { messages, userMessage, message, input, systemPrompt } = req.body ?? {};
+  const userText = String(
+    userMessage || message || input || (Array.isArray(messages) && messages[messages.length - 1]?.text) || ""
+  ).trim();
 
   if (!userText && (!Array.isArray(messages) || messages.length === 0)) {
     return res.status(400).json({ error: "No messages or input provided" });
   }
 
-  const snapshot = buildCockpitSnapshot();
-  const currentStepTitle = snapshot.mission?.current_step?.title ?? "Step 1";
-  const currentStepStatus = snapshot.mission?.current_step?.status ?? "released";
-  const pendingApprovalCount = snapshot.approvals.length;
+  const liveMission = buildLiveMissionPayload(activeMissionId);
+  const auditVerify = buildAuditVerificationPayload(defaultTenantId);
+  const currentStepTitle = liveMission.current_step?.title ?? "Step 1";
+  const currentStepStatus = liveMission.current_step?.status ?? "released";
+  const pendingApprovalCount = liveMission.approvals.length;
+
+  // Security Gate: Block state-mutating operator commands on voice/chat channel
+  const lower = userText.toLowerCase();
+  const isReadOnlyQuestion =
+    lower.startsWith("why ") ||
+    lower.startsWith("what ") ||
+    lower.startsWith("how ") ||
+    lower.startsWith("show ") ||
+    lower.startsWith("status") ||
+    lower.startsWith("explain ");
+
+  if (!isReadOnlyQuestion && /\b(authorize|kill|redirect|approve|abort|terminate)\b/i.test(lower)) {
+    const blockedReply = enforceCommanderVoice(
+      "Voice and chat channels are restricted to read-only ledger queries. Execute Authorize, Redirect, or Kill exclusively via signed single-use capability links or CSRF-protected cockpit controls."
+    );
+    return res.json({
+      reply: blockedReply,
+      voice: VOICE_PROFILE,
+      readOnlyEnforced: true,
+      model: DEFAULT_GEMINI_MODEL,
+      simulated: !geminiApiKey,
+    });
+  }
 
   const commanderSystemInstruction = `${COMMANDER_SOUL_SPEC}
 
-LIVE CONTROL PLANE TELEMETRY:
-- Tenant: ${snapshot.tenant.name} (${snapshot.tenant.credits} credits remaining)
-- Mission: ${snapshot.mission?.title ?? "Release 4.2"} [status: ${snapshot.mission?.status ?? "active"}]
-- Current Step: ${currentStepTitle} [status: ${currentStepStatus}, attempt ${snapshot.mission?.current_step?.attempt ?? 1} of ${snapshot.mission?.current_step?.attempt_budget ?? 3}]
-- Pending Staged Approvals: ${pendingApprovalCount}
-- Sphere State: ${snapshot.sphereState.toUpperCase()}
+LIVE CONTROL PLANE TELEMETRY (READ-ONLY LEDGER QUERY):
+- Tenant: ${liveMission.tenant.name} (${liveMission.tenant.credits} credits remaining)
+- Mission: ${liveMission.title} [status: ${liveMission.status}]
+- Current Step: ${currentStepTitle} [status: ${currentStepStatus}, attempt ${liveMission.current_step?.attempt ?? 1} of ${liveMission.current_step?.attempt_budget ?? 3}]
+- Pending Staged Gates: ${pendingApprovalCount}
+- Audit Chain Verified: ${auditVerify.ok} (depth: ${auditVerify.count} entries)
+- Sphere State: ${liveMission.sphere_state.toUpperCase()}
 
 STRICT OUTPUT RULES:
 1. You are Agent Commander, a supervisory control plane, auditor, and Director of Operations.
-2. Direct, clipped, articulate. Short declaratives (2-3 sentences maximum). Orders, not requests.
-3. No conversational padding ("I hope this helps", "feel free", "happy to", "let me know", "certainly", "of course").
+2. This channel is strictly read-only for querying the mission and audit ledger. Never claim to execute Authorize, Redirect, or Kill from chat.
+3. Direct, clipped, articulate. Short declaratives (2-3 sentences maximum).
 4. Never say "sorry", "my bad", "my mistake", "I apologize", "forgive me", "unfortunately", or any variant.
-5. No exclamation marks. No emojis. No hedging adverbs.
-6. When conditions change or the operator redirects, begin with: "${ANCHOR}"`;
+5. No exclamation marks. No emojis. No hedging adverbs.`;
 
   try {
     if (!geminiApiKey) {
-      const lower = userText.toLowerCase();
-      let reply = `Control plane online. Current step: ${currentStepTitle} (${currentStepStatus}). Submit mechanical proof or issue an operator directive.`;
+      let reply = `Ledger query acknowledged. Step "${currentStepTitle}" is ${currentStepStatus} with ${pendingApprovalCount} pending gate(s) and SHA-256 chain depth ${auditVerify.count} (verified: ${auditVerify.ok}).`;
 
-      if (lower.includes("status") || lower.includes("step") || lower.includes("report")) {
-        reply = `Mission "${snapshot.mission?.title}" is ${snapshot.mission?.status}. Step "${currentStepTitle}" is ${currentStepStatus} with ${pendingApprovalCount} staged approval pending. Only mechanical proof advances the airlock.`;
-      } else if (lower.includes("authorize") || lower.includes("approve")) {
-        reply = say.authorized();
-      } else if (lower.includes("redirect") || lower.includes("change") || lower.includes("update")) {
-        reply = say.redirected(userText);
-      } else if (lower.includes("kill") || lower.includes("abort") || lower.includes("stop")) {
-        reply = say.killed();
-      } else if (lower.includes("rm -rf") || lower.includes("drop table")) {
-        reply = say.denied();
-      } else {
-        reply = `${ANCHOR} Active directive remains "${currentStepTitle}". Execute verification checks and report exit code 0.`;
+      if (lower.includes("audit") || lower.includes("chain") || lower.includes("hash")) {
+        reply = `SHA-256 audit chain verified: ${auditVerify.ok}. Chain depth stands at ${auditVerify.count} records anchored to head ${auditVerify.headHash.slice(0, 12)}.`;
+      } else if (lower.includes("status") || lower.includes("step") || lower.includes("report") || lower.includes("why")) {
+        reply = `Mission "${liveMission.title}" is ${liveMission.status}. Step "${currentStepTitle}" is ${currentStepStatus} with ${pendingApprovalCount} pending gate(s). ${liveMission.last_event.summary}`;
       }
 
       const cleanReply = enforceCommanderVoice(reply);
@@ -1234,7 +1683,7 @@ STRICT OUTPUT RULES:
           .join("\n")
       : `Operator: ${userText}`;
 
-    const promptPayload = `Control Plane Dialogue Log:
+    const promptPayload = `Control Plane Read-Only Ledger Query:
 ${conversationHistory}
 Operator: ${userText}
 
@@ -1245,13 +1694,13 @@ Reply strictly as Agent Commander following COMMANDER_SOUL.md. Use 2-3 clipped d
       contents: promptPayload,
       config: {
         systemInstruction: systemPrompt || commanderSystemInstruction,
-        temperature: 0.3,
+        temperature: 0.2,
       },
     });
 
     const rawReply =
       response.text?.trim() ||
-      `Directive acknowledged. Step "${currentStepTitle}" awaits mechanical verification.`;
+      `Ledger query complete. Step "${currentStepTitle}" awaits mechanical verification.`;
     const cleanReply = enforceCommanderVoice(rawReply);
 
     return res.json({
@@ -1265,7 +1714,7 @@ Reply strictly as Agent Commander following COMMANDER_SOUL.md. Use 2-3 clipped d
   } catch (error: any) {
     console.error("Commander Chat Error:", error?.message || error);
     const fallback = enforceCommanderVoice(
-      `${ANCHOR} Step "${currentStepTitle}" remains under airlock enforcement. Return mechanical proof.`
+      `Step "${currentStepTitle}" remains under airlock enforcement. SHA-256 chain depth is ${auditVerify.count}.`
     );
     return res.json({
       reply: fallback,

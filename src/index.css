@@ -10,12 +10,15 @@ html,
 body,
 #root {
   min-height: 100%;
+  font-size: 16px;
 }
 
 body {
   background-color: #03060c;
-  color: #eaf6ff;
+  color: #f8fafc;
   font-family: "Space Grotesk", system-ui, sans-serif;
+  font-size: max(12px, 0.875rem);
+  line-height: 1.45;
   -webkit-font-smoothing: antialiased;
   overflow-x: hidden;
 }
@@ -367,3 +370,36 @@ body {
     transform: translateY(100vh);
   }
 }
+
+/* ---------- Accessibility: prefers-reduced-motion fallback ---------- */
+.orb-ambient-fallback {
+  display: none;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.001ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.001ms !important;
+    scroll-behavior: auto !important;
+  }
+
+  .scanline {
+    display: none !important;
+  }
+
+  .orb-canvas-motion {
+    opacity: 0.35;
+    filter: blur(2px);
+  }
+
+  .orb-ambient-fallback {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    pointer-events: none;
+  }
+}
+
