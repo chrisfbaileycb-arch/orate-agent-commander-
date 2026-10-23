@@ -1,0 +1,11 @@
+# Keep secrets, host-built artifacts and local state out of the image: `COPY . .` would otherwise bake them in.
+.git
+.env
+.env.*
+!.env.example
+node_modules
+dist
+data
+*.tsbuildinfo
+package-lock.json
+*.zip

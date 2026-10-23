@@ -789,6 +789,32 @@ describe("the visitor-facing studio routes", () => {
 });
 
 // =================================================================================================
+describe("documented settings take effect", () => {
+  it("COMMANDER_GEMINI_MODEL sets the model the server uses, and the default is unchanged without it", async () => {
+    const custom = await startServer({ COMMANDER_GEMINI_MODEL: "my-test-model" });
+    expect((await http(custom, "GET", "/healthz")).json.model).toBe("my-test-model");
+    expect((await http(main, "GET", "/healthz")).json.model).toBe("gemini-3.8-flash");
+  });
+
+  it("a blank value counts as unset, so a copied .env.example boots", async () => {
+    const blank = await startServer({
+      COMMANDER_GEMINI_MODEL: "",
+      COMMANDER_LINK_SECRET: "",
+      COMMANDER_PUBLIC_URL: "",
+      COMMANDER_SESSION_HOURS: "",
+      COMMANDER_STUDIO_RPM: "",
+      COMMANDER_STUDIO_GLOBAL_RPM: "",
+      COMMANDER_TRUST_PROXY: "",
+      COMMANDER_WITNESS_MODE: "",
+      COMMANDER_NOTIFY_WEBHOOK: "",
+      HOST: "",
+      GEMINI_API_KEY: "",
+    });
+    expect((await http(blank, "GET", "/healthz")).json.model).toBe("gemini-3.8-flash");
+  });
+});
+
+// =================================================================================================
 describe("startup refuses unsafe configuration", () => {
   it("will not start with the admin token that was published in the repository", async () => {
     const r = await startExpectingFailure({ COMMANDER_ADMIN_TOKEN: OLD_DEFAULT_ADMIN_TOKEN });

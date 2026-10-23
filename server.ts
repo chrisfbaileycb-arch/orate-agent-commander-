@@ -74,7 +74,8 @@ const ai = new GoogleGenAI({
   },
 });
 
-const DEFAULT_GEMINI_MODEL = "gemini-3.8-flash";
+// One setting for every Gemini call the server makes, the studio routes and the engine's reasoning gate alike.
+const DEFAULT_GEMINI_MODEL = process.env.COMMANDER_GEMINI_MODEL?.trim() || "gemini-3.8-flash";
 
 /* -------------------------------------------------------------------------- */
 /* SECURITY: SESSIONS, LIMITS, REQUEST CONTEXT (see src/server/security.ts)   */

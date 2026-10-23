@@ -1,13 +1,27 @@
 services:
   orator:
     build: .
-    container_name: orator-ai
+    container_name: orator-commander
     ports:
-      - "8080:8080"
+      # Loopback only. Put TLS in front of it before exposing it, then set COMMANDER_TRUST_PROXY=1 so the real client
+      # address and the https scheme are read from the proxy.
+      - "127.0.0.1:3000:3000"
     environment:
-      PORT: "8080"
-      # Keys are read from the host environment only — never commit values.
-      OPENROUTER_API_KEY: "${OPENROUTER_API_KEY:-}"
-      OPENAI_API_KEY: "${OPENAI_API_KEY:-}"
+      PORT: "3000"
+      NODE_ENV: production
+      COMMANDER_DATA_DIR: /data
+      # Read from the host environment or an .env file next to this one. Never commit values. A blank value is unset.
+      # With no cockpit token, a random one is generated per start and printed once: `docker compose logs orator`.
+      COMMANDER_COCKPIT_TOKEN: "${COMMANDER_COCKPIT_TOKEN:-}"
+      COMMANDER_ADMIN_TOKEN: "${COMMANDER_ADMIN_TOKEN:-}"
+      COMMANDER_LINK_SECRET: "${COMMANDER_LINK_SECRET:-}"
+      COMMANDER_PUBLIC_URL: "${COMMANDER_PUBLIC_URL:-}"
+      COMMANDER_TRUST_PROXY: "${COMMANDER_TRUST_PROXY:-}"
       GEMINI_API_KEY: "${GEMINI_API_KEY:-}"
+      ANTHROPIC_API_KEY: "${ANTHROPIC_API_KEY:-}"
+    volumes:
+      - commander-data:/data
     restart: unless-stopped
+
+volumes:
+  commander-data:
