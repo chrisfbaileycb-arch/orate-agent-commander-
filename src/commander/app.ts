@@ -39,7 +39,7 @@ export function createApp(opts: AppOptions): App {
   const gate =
     opts.gate ??
     (config.geminiApiKey
-      ? new GeminiGate({ apiKey: config.geminiApiKey, model: config.geminiModel, fetchImpl: opts.fetchImpl })
+      ? new GeminiGate({ apiKey: config.geminiApiKey, model: config.geminiModel })
       : new NullGate());
   const notifier =
     opts.notifier ??
