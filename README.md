@@ -126,9 +126,35 @@ timestamps are strict ISO-8601 UTC.
 
 ```bash
 npm install        # or: bun install
-npm run dev        # vite dev server on 0.0.0.0:$PORT (default 8080)
-npm run build      # typecheck + static build to dist/
+npm run dev        # Express + Vite on http://localhost:3000 (PORT / HOST to change)
+npm test           # the engine, the security gate and the end-to-end suites
+npm run build      # typecheck, static build to dist/, and the guard bundle
 ```
+
+Settings are documented in [`.env.example`](.env.example). Copy it to `.env` to use them; every value is optional.
+
+## Agent Commander: the supervisory layer
+
+The forge is paired with **Agent Commander**, a control plane that sits above third-party agents and will not let a
+workflow advance without mechanical proof. The design is in [`docs/COMMANDER.md`](docs/COMMANDER.md) and
+[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md); the engine is `src/commander/`, and `server.ts` serves it.
+
+- **The operator cockpit is locked.** The server log prints an unlock token for the run (or set
+  `COMMANDER_COCKPIT_TOKEN`). Visitors get the Orator pages and clearly labelled demos; nothing that carries operator
+  authority is reachable without the token. In development, with no token of your own set, a browser on the same machine
+  is unlocked automatically.
+- **Beta key setup: bring your own key.** No key ships with the product. To get live model output a tester pastes their
+  own Gemini API key into the box in the page header. It stays in that browser tab, is sent to the server only to make
+  their request, and is never stored or logged. Without one, the studio returns demo results that say so. The server's
+  `GEMINI_API_KEY` is the operator's own and is used only for operator-only features behind the unlock. When the product
+  goes public and the key setup changes, the places to change are `src/lib/byok.ts`, `src/server/byok.ts` and
+  `src/components/ByokKeyControl.tsx`. A restricted key with a low quota is the sensible kind to paste.
+- **Docker.** `docker compose up --build` serves it on `127.0.0.1:3000` (loopback only; see `docker-compose.yml`). Put TLS
+  in front of it before exposing it, and set `COMMANDER_TRUST_PROXY=1` so the real client address is read from the proxy.
+- **Guard for Claude Code.** `npm run build:guard`, then follow "Guard Claude Code's native tools" in `docs/COMMANDER.md`.
+- **Embedded previews.** The unlock is a session cookie. Where a page is embedded in another site (AI Studio's preview
+  pane, for example) a browser may block third-party cookies, and Safari does by default; if the unlock does not stick,
+  open the app in its own tab. This has not been tried inside AI Studio's preview.
 
 ## Live Routing (Optional)
 

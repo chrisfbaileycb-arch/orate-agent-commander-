@@ -28,19 +28,30 @@ check itself.
 
 | Blueprint component | Where |
 |---|---|
-| Two-phase step-gated airlock, leases, quarantine | `src/airlock.ts` |
-| Mechanical Proof Auditor (8 verifiers, hidden checks, nonces) | `src/verifiers.ts` |
-| **Independent witnessing**: Commander runs the check and reads the disk itself | `src/witness.ts` |
-| **Native-tool guard**: Claude Code `PreToolUse` hook through the Sentinel | `src/guard/`, `guard/claude-code/settings.json` |
-| Inquisitor Diff Auditor (paths, secrets, size) | `src/inquisitor.ts` |
-| Perimeter Sentinel (shell / SQL / HTTP / fs, egress allowlist, loop + burn detection) | `src/sentinel.ts`, `src/auth.ts` |
-| Just-In-Time Markdown Pruning Filter | `src/pruner.ts` |
-| Frontier Reasoning Interceptor Gate (Gemini, tighten-only) | `src/gate.ts` |
-| MCP gateway + API-key facade + SaaS credit metering | `src/mcp.ts`, `src/http.ts`, `src/auth.ts` |
-| Persona (`COMMANDER_SOUL.md`) and voice guard | `COMMANDER_SOUL.md`, `src/persona.ts` |
-| Desktop/Web HUD | `src/hud/` (served at `/hud`) |
-| Mobile Push Sentinel (Authorize / Redirect / Kill) | `src/approvals.ts`, signed links in `src/http.ts` |
-| Tamper-evident audit ledger (hash-chained per tenant) | `src/store.ts` |
+The engine lives in `src/commander/` and is the only copy: `server.ts` imports it, and its tests sit beside it and run
+against exactly what ships. `server.ts` wraps it in the Express app (the cockpit UI, the security gate in
+`src/server/security.ts`, the MCP endpoint, the REST APIs).
+
+| Blueprint component | Where |
+|---|---|
+| Two-phase step-gated airlock, leases, quarantine | `src/commander/airlock.ts` |
+| Mechanical Proof Auditor (8 verifiers, hidden checks, nonces) | `src/commander/verifiers.ts` |
+| **Independent witnessing**: Commander runs the check and reads the disk itself | `src/commander/witness.ts` |
+| **Native-tool guard**: Claude Code `PreToolUse` hook through the Sentinel | `src/commander/guard/`, `guard/claude-code/settings.json` |
+| Inquisitor Diff Auditor (paths, secrets, size) | `src/commander/inquisitor.ts` |
+| Perimeter Sentinel (shell / SQL / HTTP / fs, egress allowlist, loop + burn detection) | `src/commander/sentinel.ts`, `src/commander/auth.ts` |
+| Just-In-Time Markdown Pruning Filter | `src/commander/pruner.ts` |
+| Frontier Reasoning Interceptor Gate (Gemini, tighten-only) | `src/commander/gate.ts` |
+| MCP gateway + API-key facade + SaaS credit metering | `src/commander/mcp.ts`, `src/commander/auth.ts`, routes in `server.ts` |
+| Persona (`COMMANDER_SOUL.md`) and voice guard | `COMMANDER_SOUL.md`, `src/commander/persona.ts` |
+| Operator cockpit (React; locked behind an unlock token) | `src/components/Landing.tsx`, `server.ts` |
+| Mobile Push Sentinel (Authorize / Redirect / Kill) | `src/commander/approvals.ts`, signed links at `/a/:id` in `server.ts` |
+| Tamper-evident audit ledger (hash-chained per tenant) | `src/commander/store.ts` |
+| Deny-by-default route gate, cockpit sessions, rate limits | `src/server/security.ts` |
+| Beta key setup: visitors bring their own Gemini key | `src/lib/byok.ts`, `src/server/byok.ts` |
+
+`src/commander/http.ts` and `src/commander/hud/` are the engine's original standalone HTTP front end and dashboard. They
+are still exercised by the tests but `server.ts` does not use them.
 
 ## Try it
 
@@ -56,26 +67,40 @@ contains a complete example mission.
 ## Run it
 
 ```bash
-export COMMANDER_ADMIN_TOKEN=$(openssl rand -hex 24)
-export COMMANDER_LINK_SECRET=$(openssl rand -hex 32)
-export COMMANDER_DATA_DIR=./data
-npm run dev                      # or: npm run build && npm start
+npm install
+npm run dev          # Express + Vite on http://localhost:3000
+```
+
+The operator cockpit is locked. The log prints an **unlock token** for the run (or set `COMMANDER_COCKPIT_TOKEN` to a
+value of your own, 16+ characters). In development, if you have not set a token of your own, a browser on the same
+machine is unlocked automatically; anywhere else, paste the token into the cockpit's unlock box. Visitors see the labelled demo and the public Orator pages, and
+nothing that carries operator authority. For any real deployment set `NODE_ENV=production`.
+
+To provision tenants and mint keys, enable the platform admin API with a secret of your own:
+
+```bash
+export COMMANDER_ADMIN_TOKEN=$(openssl rand -hex 24)     # unset = /v1/admin is disabled
+export COMMANDER_LINK_SECRET=$(openssl rand -hex 32)     # unset = approval links die on restart
+export COMMANDER_DATA_DIR=./data                         # unset = in-memory
+npm run dev
 ```
 
 Provision a tenant, mint a worker key, open a mission:
 
 ```bash
 # platform admin: create a tenant (returns the operator key once)
-curl -s -X POST localhost:8787/v1/admin/tenants \
+curl -s -X POST localhost:3000/v1/admin/tenants \
   -H "Authorization: Bearer $COMMANDER_ADMIN_TOKEN" -H 'content-type: application/json' \
   -d '{"name":"acme","credits":1000}'
 
-# operator: mint a worker key (cmd_live_…) and open a mission (see scripts/demo.ts for a full mission body)
-curl -s -X POST localhost:8787/v1/operator/keys -H "Authorization: Bearer $OP" -H 'content-type: application/json' -d '{"label":"claude-code"}'
-curl -s -X POST localhost:8787/v1/operator/missions -H "Authorization: Bearer $OP" -H 'content-type: application/json' -d @mission.json
+# operator: mint a worker key (cmd_live_…) and open a mission (see scripts/commander-demo.ts for a full mission body)
+curl -s -X POST localhost:3000/v1/operator/keys -H "Authorization: Bearer $OP" -H 'content-type: application/json' -d '{"label":"claude-code"}'
+curl -s -X POST localhost:3000/v1/operator/missions -H "Authorization: Bearer $OP" -H 'content-type: application/json' -d @mission.json
 ```
 
-Open `http://localhost:8787/hud` and paste the operator key.
+A tenant's missions and approvals belong to that tenant alone: they never appear in, or change, the cockpit's own sandbox
+mission. With `COMMANDER_DATA_DIR` set, provisioned tenants persist across restarts; the cockpit's built-in sandbox is
+recreated on each start, and the previous one stays behind in the data directory.
 
 ### Point a worker at it
 
@@ -115,7 +140,7 @@ and asks the server. **Exit 0** lets the call proceed. **Exit 2** blocks it and 
 Commander's redirect patch becomes the model's next instruction.
 
 ```bash
-npm run build                                   # produces dist/guard/claude-hook.js
+npm run build:guard                             # bundles the hook, dependencies included, into one file: dist/guard/claude-hook.js
 node dist/guard/claude-hook.js --print-settings \
   --url https://commander.example.com --mission msn_…   # prints the settings fragment; merge it into .claude/settings.json
 export COMMANDER_KEY=cmd_live_…                 # a worker key. Set it in the shell that runs Claude Code; it is never written to a file
@@ -138,6 +163,11 @@ Behaviour worth knowing:
 - **It fails closed.** An unreachable server, a server fault, a half-configured hook, malformed hook input or a bug in
   the hook all block the call. `FAIL_OPEN` excuses only "Commander is unreachable"; a rejected key, a held mission or a
   denial still blocks.
+- **Even when the hook cannot start.** Claude Code blocks only on exit code 2 and lets a call through on any other
+  non-zero exit, so a missing file, a syntax error, an unsupported Node or no `node` on the path would otherwise
+  disable the guard silently. The installed command therefore ends `|| exit 2`: anything that is not the hook's own
+  verdict becomes a block. The bundle is one self-contained file that needs no `node_modules`, and
+  `--print-settings` refuses an install path a shell would expand (`$`, a backtick, `"`, `%`).
 - **Staging works the same way as over MCP.** A production-impacting call pauses the mission and your phone shows
   `NATIVE Bash: …`. After you authorize, the model retries the same command and it is cleared **once**. The pass is bound
   to that mission, step and exact action (whitespace-normalized), expires after one lease lifetime, and cannot be
@@ -294,19 +324,27 @@ Read this before relying on it.
 ## Layout
 
 ```
-src/
+server.ts                   the Express app: security gate, cockpit and REST routes, MCP endpoint, SSE, Vite / static
+src/commander/              the engine (tests sit beside the code, *.test.ts)
   airlock.ts      state machine: missions, leases, proof, clearance, quarantine, decisions
   verifiers.ts    mechanical verifiers          inquisitor.ts   diff + secret audit
   sentinel.ts     action rules + loop detection  pruner.ts       evidence -> manifest
   gate.ts         reasoning gate (Gemini)        persona.ts      voice + redirect patches
   approvals.ts    staging, signed links, push    metrics.ts      HUD telemetry
   auth.ts         keys, roles, credits, burn     store.ts        state + hash-chained audit
-  mcp.ts          the five worker tools          http.ts         router, operator/admin APIs, HUD, links
+  mcp.ts          the five worker tools          http.ts         standalone HTTP front end (not used by server.ts)
   witness.ts      independent runner + verifiers render.ts       plain-text replies shared by MCP and the guard
-  app.ts          composition root               index.ts        process entry
+  app.ts          composition root               test-helpers.ts shared test fixtures
   guard/          Claude Code PreToolUse hook: map.ts (tool call -> action), hook.ts (verdict -> exit code), claude-hook.ts (CLI)
-  hud/            static dashboard (strict CSP, no innerHTML)
-test/             unit + end-to-end suites       scripts/demo.ts  scripted end-to-end run
+  hud/            standalone dashboard (strict CSP, no innerHTML), served by http.ts only
+src/server/
+  security.ts     route classes, cockpit sessions, CSRF, rate limits, startup config
+  byok.ts         where the server gets a visitor's Gemini key (beta: from the visitor only)
+src/lib/byok.ts             where the browser keeps it (this tab only)
+src/components/             the React cockpit and the Orator studio
+guard/claude-code/          settings.json template for the guard
+vite.guard.config.ts        bundles the guard into dist/guard/claude-hook.js
+scripts/commander-demo.ts   scripted end-to-end run (npm run demo)
 ```
 
 ## Roadmap, in the order I would do it

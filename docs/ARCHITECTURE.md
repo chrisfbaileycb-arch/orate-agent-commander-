@@ -14,6 +14,36 @@
 Keys are stored as SHA-256 hashes. Every record lookup is tenant-checked, and a record in another tenant is
 indistinguishable from one that does not exist (`NOT_FOUND`).
 
+### In front of the engine: who can reach what
+
+`server.ts` puts `src/server/security.ts` in front of every route. The engine's own role checks are the second line;
+this is the first, and it is deny-by-default. Each request is classified before anything is parsed:
+
+| Class | Routes | Needs |
+|---|---|---|
+| `public` | `/healthz`, static assets, signed approval links (`/a/:id`, authenticated by their HMAC), the cockpit session endpoint | nothing |
+| `studio` | `/api/gemini/explore`, `/api/gemini/cortex-deliberate`, `/api/gemini/status` | nothing, but rate limited per client and in total, and size capped. In the beta they use only a Gemini key the visitor supplies (`src/server/byok.ts`) |
+| `cockpit` | the operator UI's own surface: `/v1/missions`, `/v1/events`, `/api/commander/*`, `/api/gemini/generate`, the chat routes. **Any route not listed is `cockpit`.** | an unlocked cockpit session (HttpOnly cookie) plus that session's CSRF token on state-changing requests |
+| `bearer` | `/v1/operator/*`, `/v1/mcp`, `/v1/guard/clearance` | a real key, then the role the route needs (operator or worker) |
+| `admin` | `/v1/admin/*` | `COMMANDER_ADMIN_TOKEN`; the whole class is disabled when it is unset, and the previously published default is refused at startup |
+
+- **Paths are normalized before they are classified**: case, `//`, dot segments and percent-encoding, and the stricter
+  reading wins, so a spelling trick cannot move a route into a looser class. An undecodable path is `cockpit`.
+- **The cockpit session is not an engine credential.** It reaches the cockpit's own sandbox tenant and nothing else: not
+  `/v1/operator/*`, not `/v1/mcp`, not `/v1/admin/*`, even with a valid CSRF token.
+- **The unlock token** is `COMMANDER_COCKPIT_TOKEN`, or a random one generated per run and printed once. Wrong guesses
+  are rate limited per client. A browser on the same machine is unlocked automatically only when the token was generated,
+  the run is not production, the socket and the `Host` header are loopback, and no proxy headers are present.
+- **The cockpit's sandbox tenant is separate from every other tenant.** Missions and approvals that belong to another
+  tenant never move the cockpit's active mission, never enter its event log, and are never broadcast into its stream. The
+  CSRF token is delivered only to the session it belongs to, never broadcast.
+- **The independent witness is inspect-only unless explicitly enabled** (`COMMANDER_WITNESS_MODE=local` with an
+  allowlist). A mission that asks for a witnessed command on a deployment that cannot run one is rejected at open.
+- **Two Gemini keys, never mixed.** `GEMINI_API_KEY` is the operator's and serves only the reasoning gate and cockpit
+  routes. A visitor's key arrives in a header, is used for that one request, and is never stored or logged.
+
+This is exercised by `src/server/server.e2e.test.ts`, which starts the real `server.ts` and attacks it over HTTP.
+
 ## Mission state machine
 
 ```
