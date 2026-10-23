@@ -7,6 +7,9 @@ __pycache__/
 .env.*
 !.env.example
 
+# Agent Commander persistence (COMMANDER_DATA_DIR): the ledger and approval state, not source
+data/
+
 # Node / Vite
 node_modules/
 dist/
