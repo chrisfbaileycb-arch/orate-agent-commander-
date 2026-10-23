@@ -26,6 +26,7 @@ import { BUILD_PASS_REGISTRY } from "./build-pass-service";
 import { globalModelRouter } from "./model-router-service";
 import type { IngestItem } from "./types";
 import { appNameFromAnswers, archetypeFromAnswers } from "./router";
+import { withGeminiKey } from "./byok";
 
 const STORAGE_EXPLORATIONS_KEY = "orator.design_explorations.v1";
 const STORAGE_ACCOUNT_KEY = "orator.exploration_account.v1";
@@ -249,7 +250,7 @@ export class DesignExplorationService {
         try {
           const res = await fetch("/api/gemini/explore", {
             method: "POST",
-            headers: { "Content-Type": "application/json" },
+            headers: withGeminiKey({ "Content-Type": "application/json" }),
             body: JSON.stringify({ answers, ingest }),
           });
           if (res.ok) {

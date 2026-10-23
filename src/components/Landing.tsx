@@ -4,6 +4,7 @@ import type { ScarcityTelemetry } from "../lib/types";
 import type { DesignExploration } from "../lib/exploration-types";
 import CortexTorus3D, { type AirlockSphereState } from "./cortex/CortexTorus3D";
 import LivingBuildTree from "./LivingBuildTree";
+import ByokKeyControl from "./ByokKeyControl";
 import SlideOverAppViewport from "./SlideOverAppViewport";
 import { orate, hush, listen, listeningSupported, type ListenHandle } from "../lib/voice";
 import {
@@ -389,6 +390,9 @@ export default function Landing(_props: Props) {
               {sseConnected ? "LIVE ENGINE · SSE" : "LIVE ENGINE · HTTP"}
             </span>
           )}
+
+          {/* Beta key setup: a tester brings their own Gemini key; without one the studio answers with labelled demo results */}
+          <ByokKeyControl />
 
           {/* Operator unlock: visitors see the labelled demo, an operator unlocks the live cockpit */}
           {cockpitLocked && (

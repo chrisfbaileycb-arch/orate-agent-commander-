@@ -2,7 +2,7 @@ import { GoogleGenAI, Type } from '@google/genai';
 import { z } from 'zod';
 import { redactSecrets } from './inquisitor.js';
 import type { ActionRequest, Finding } from './types.js';
-import { sanitizeLine } from './util.js';
+import { sanitizeLine, withDeadline } from './util.js';
 
 /**
  * Frontier Reasoning Interceptor Gate.
@@ -70,20 +70,6 @@ export interface GeminiGateOptions {
 }
 
 const DEFAULT_TIMEOUT_MS = 8000;
-
-/**
- * Settles within `ms` whatever the call does. The SDK is also handed an abort signal so the request is cancelled, but
- * the deadline does not depend on it: a gate that hangs would hold the worker's clearance request open indefinitely.
- */
-function withDeadline<T>(call: Promise<T>, ms: number): Promise<T> {
-  let timer: ReturnType<typeof setTimeout> | undefined;
-  const deadline = new Promise<never>((_resolve, reject) => {
-    timer = setTimeout(() => reject(new Error('gate timed out')), ms);
-  });
-  // If the deadline wins, a late failure from the abandoned call must not surface as an unhandled rejection.
-  call.catch(() => undefined);
-  return Promise.race([call, deadline]).finally(() => clearTimeout(timer));
-}
 
 export class GeminiGate implements ReasoningGate {
   readonly active = true;

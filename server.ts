@@ -22,6 +22,7 @@ import {
 } from "./src/commander/persona.js";
 import { Sentinel } from "./src/commander/sentinel.js";
 import { GENESIS } from "./src/commander/store.js";
+import { withDeadline } from "./src/commander/util.js";
 import { runVerifiers } from "./src/commander/verifiers.js";
 import {
   ActionRequestSchema,
@@ -44,6 +45,7 @@ import {
   loadSecurityConfig,
   type Denied,
 } from "./src/server/security.js";
+import { DEMO_COPY, classifyModelFailure, resolveStudioKey, scrubKey, type StudioReason } from "./src/server/byok.js";
 
 dotenv.config();
 
@@ -73,6 +75,11 @@ const ai = new GoogleGenAI({
     },
   },
 });
+
+// The client above carries the operator's own key and serves operator-only features. The open studio routes never use it:
+// in the beta a visitor brings their own key (src/server/byok.ts), so a stranger cannot spend the operator's.
+const STUDIO_MODEL_TIMEOUT_MS = 20_000;
+const studioAi = (apiKey: string) => new GoogleGenAI({ apiKey, httpOptions: { headers: { "User-Agent": "aistudio-build" } } });
 
 // One setting for every Gemini call the server makes, the studio routes and the engine's reasoning gate alike.
 const DEFAULT_GEMINI_MODEL = process.env.COMMANDER_GEMINI_MODEL?.trim() || "gemini-3.8-flash";
@@ -1720,12 +1727,14 @@ app.post(["/api/commander/verifiers/run", "/v1/verifiers/verify"], (req, res) =>
 /* API ROUTES: GEMINI PROJECT INTEGRATION & COMMANDER_SOUL DIALOGUE ENGINE    */
 /* -------------------------------------------------------------------------- */
 
-app.get("/api/gemini/status", (_req, res) => {
+app.get("/api/gemini/status", (req, res) => {
   res.json({
     status: "online",
     defaultProvider: "Google Gemini Project (Primary Route)",
     defaultModel: DEFAULT_GEMINI_MODEL,
-    hasApiKey: Boolean(geminiApiKey && geminiApiKey.length > 0),
+    // Beta: each visitor brings their own key. This says whether THIS request carried one (a shape check, not Google's verdict).
+    keyMode: "bring-your-own",
+    hasApiKey: Boolean(resolveStudioKey(req.headers)),
     persona: "COMMANDER_SOUL",
     voiceProfile: VOICE_PROFILE,
     capabilities: [
@@ -1774,9 +1783,9 @@ app.post("/api/gemini/generate", async (req, res) => {
       simulated: false,
     });
   } catch (error: any) {
-    console.error("Gemini Generation Error:", error?.message || error);
+    console.error("Gemini Generation Error:", scrubKey(String(error?.message ?? error), geminiApiKey));
     return res.status(500).json({
-      error: error?.message || "Internal error calling Gemini API",
+      error: scrubKey(String(error?.message ?? "Internal error calling Gemini API"), geminiApiKey),
       model: DEFAULT_GEMINI_MODEL,
     });
   }
@@ -1911,22 +1920,25 @@ Reply strictly as Agent Commander following COMMANDER_SOUL.md. Use 2-3 clipped d
 
 // 3. CORTEX Step Deliberation (Real Agentic Telemetry Stream)
 app.post("/api/gemini/cortex-deliberate", async (req, res) => {
-  const { taskPrompt, phase = "draft", agentName = "Agent Commander" } = req.body;
+  const { taskPrompt, phase = "draft", agentName = "Agent Commander" } = req.body ?? {};
+  // A demo result says so. It never claims a model ran when none did.
+  const demo = (reason: StudioReason) =>
+    res.json({
+      simulated: true,
+      reason,
+      title: `${agentName}: ${phase} gate (demo)`,
+      detail: DEMO_COPY[reason],
+      confidence: 0,
+      tokenCount: 0,
+      model: null,
+      provider: "Demo: no live model ran",
+    });
+
+  const key = resolveStudioKey(req.headers);
+  if (!key) return demo("no_key");
 
   try {
-    if (!geminiApiKey) {
-      const confidence = 0.92 + Math.random() * 0.07;
-      return res.json({
-        title: `${agentName}: Auditing ${phase} gate`,
-        detail: `Mechanical verifier boundary enforced for: ${taskPrompt || "Airlock step"}. Conf: ${(confidence * 100).toFixed(0)}%.`,
-        confidence,
-        tokenCount: Math.floor(180 + Math.random() * 120),
-        model: DEFAULT_GEMINI_MODEL,
-        provider: "Google Gemini Project (Active)",
-      });
-    }
-
-    const response = await ai.models.generateContent({
+    const call = studioAi(key).models.generateContent({
       model: DEFAULT_GEMINI_MODEL,
       contents: `Task: "${taskPrompt || "Enforce step-gated airlock invariants"}".
 Phase: ${phase}.
@@ -1935,8 +1947,10 @@ Respond with a concise, single-sentence technical step title and a 1-sentence va
       config: {
         systemInstruction: `${COMMANDER_SOUL_SPEC}\nReturn concise engineering audit decisions.`,
         temperature: 0.2,
+        abortSignal: AbortSignal.timeout(STUDIO_MODEL_TIMEOUT_MS),
       },
     });
+    const response = await withDeadline(call, STUDIO_MODEL_TIMEOUT_MS);
 
     const text = response.text || "";
     const lines = text.split("\n").filter((l) => l.trim().length > 0);
@@ -1950,6 +1964,7 @@ Respond with a concise, single-sentence technical step title and a 1-sentence va
     const confidence = 0.92 + Math.random() * 0.07;
 
     return res.json({
+      simulated: false,
       title: enforceCommanderVoice(title),
       detail: enforceCommanderVoice(detail),
       confidence,
@@ -1958,33 +1973,29 @@ Respond with a concise, single-sentence technical step title and a 1-sentence va
       provider: "Google Gemini Project (Active)",
     });
   } catch (error: any) {
-    console.error("Cortex Deliberation Error:", error?.message || error);
-    return res.json({
-      title: `${agentName}: ${phase} audit`,
-      detail: `Mechanical constraints verified. Conf: 94%.`,
-      confidence: 0.94,
-      tokenCount: 220,
-      model: DEFAULT_GEMINI_MODEL,
-      provider: "Google Gemini Project (Active)",
-    });
+    console.error("Cortex Deliberation Error:", scrubKey(String(error?.message ?? error), key));
+    return demo(classifyModelFailure(error));
   }
 });
 
 // 4. Design Exploration Brief Generation
+// Only the fields the client reads, and only with the right shape: the model's output is not trusted to add others.
+const ExploreReply = z.object({
+  conceptName: z.string().max(120),
+  summary: z.string().max(600),
+  strengths: z.array(z.string().max(200)).max(6).default([]),
+});
+
 app.post("/api/gemini/explore", async (req, res) => {
-  const { answers, ingest } = req.body;
+  const { answers, ingest } = req.body ?? {};
+  // No canned concept: when no model ran the client keeps its own deterministic brief instead of showing someone else's.
+  const demo = (reason: StudioReason) => res.json({ simulated: true, reason, model: null });
+
+  const key = resolveStudioKey(req.headers);
+  if (!key) return demo("no_key");
 
   try {
-    if (!geminiApiKey) {
-      return res.json({
-        conceptName: "Sovereign Airlock Architecture",
-        summary: "Step-gated supervisory control plane with deterministic Sentinel tripwires and mechanical proof verifiers.",
-        strengths: ["Step-gated airlock", "Hash-chained audit ledger", "Zero self-report trust"],
-        model: DEFAULT_GEMINI_MODEL,
-      });
-    }
-
-    const response = await ai.models.generateContent({
+    const call = studioAi(key).models.generateContent({
       model: DEFAULT_GEMINI_MODEL,
       contents: `User Inquest Answers: ${JSON.stringify(answers || {})}. User Ingest: ${JSON.stringify(ingest || {})}.
 Produce a JSON object with:
@@ -1993,22 +2004,17 @@ Produce a JSON object with:
 "strengths": array of 3 short key technical strengths.`,
       config: {
         responseMimeType: "application/json",
+        abortSignal: AbortSignal.timeout(STUDIO_MODEL_TIMEOUT_MS),
       },
     });
+    const response = await withDeadline(call, STUDIO_MODEL_TIMEOUT_MS);
 
-    const parsed = JSON.parse(response.text || "{}");
-    return res.json({
-      ...parsed,
-      model: DEFAULT_GEMINI_MODEL,
-    });
+    const reply = ExploreReply.safeParse(JSON.parse(response.text || "{}"));
+    if (!reply.success) return demo("model_error");
+    return res.json({ ...reply.data, simulated: false, model: DEFAULT_GEMINI_MODEL });
   } catch (error: any) {
-    console.error("Exploration Gen Error:", error?.message || error);
-    return res.json({
-      conceptName: "Autonomous System Concept",
-      summary: "Decomposed multi-layered architecture built for verified production delivery.",
-      strengths: ["Deterministic AST generation", "Zero-trust secrets boundary", "Verified endpoints"],
-      model: DEFAULT_GEMINI_MODEL,
-    });
+    console.error("Exploration Gen Error:", scrubKey(String(error?.message ?? error), key));
+    return demo(classifyModelFailure(error));
   }
 });
 

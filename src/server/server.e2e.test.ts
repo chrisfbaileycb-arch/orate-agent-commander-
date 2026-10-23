@@ -7,7 +7,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
-import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
+import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 
 /**
  * The real server.ts, started as a subprocess and attacked over HTTP. These are the exact holes the first version had:
@@ -258,6 +258,19 @@ let noWitness: Srv; // witness switched off
 let dev: Srv; // development run, generated token, local convenience session
 let generated: Srv; // production run with a generated token
 let linked: Srv; // delivers its signed approval links to a local webhook
+let byok: Srv; // has the operator's own Gemini key set, and talks to the fake Gemini below
+
+/** Stands in for the Gemini API, so the server's real SDK path runs without a network. It echoes the key it was given in its errors. */
+const VISITOR_KEY = "visitor-sentinel-key-0123456789abcdef";
+const OPERATOR_KEY = "operator-sentinel-key-fedcba9876543210";
+interface Upstream {
+  url: string;
+  key: string | undefined;
+  body: any; // eslint-disable-line @typescript-eslint/no-explicit-any
+}
+const upstream: Upstream[] = [];
+let upstreamMode: "ok" | "reject" | "quota" | "wrongshape" = "ok";
+let gemini: nodeHttp.Server;
 
 /** Stands in for the phone or chat relay that receives approval cards. */
 interface Card {
@@ -283,7 +296,32 @@ beforeAll(async () => {
   await new Promise<void>((resolve) => hook.listen(0, "127.0.0.1", resolve));
   const hookUrl = `http://127.0.0.1:${(hook.address() as net.AddressInfo).port}/notify`;
 
-  [main, limited, brute, noWitness, dev, generated, linked] = await Promise.all([
+  gemini = nodeHttp.createServer((req, res) => {
+    let raw = "";
+    req.on("data", (c: Buffer) => (raw += c));
+    req.on("end", () => {
+      const key = req.headers["x-goog-api-key"] as string | undefined;
+      let body: any = {}; // eslint-disable-line @typescript-eslint/no-explicit-any
+      try {
+        body = JSON.parse(raw);
+      } catch {
+        /* not json */
+      }
+      upstream.push({ url: req.url ?? "", key, body });
+      const send = (status: number, payload: unknown) => res.writeHead(status, { "content-type": "application/json" }).end(JSON.stringify(payload));
+      if (upstreamMode === "reject") return send(400, { error: { code: 400, status: "INVALID_ARGUMENT", message: `API key not valid: ${key}` } });
+      if (upstreamMode === "quota") return send(429, { error: { code: 429, status: "RESOURCE_EXHAUSTED", message: `Quota exceeded for ${key}` } });
+      const wantsJson = body?.generationConfig?.responseMimeType === "application/json";
+      const text = wantsJson
+        ? JSON.stringify(upstreamMode === "wrongshape" ? { conceptName: 5 } : { conceptName: "Beacon", summary: "A calm tool for a real problem.", strengths: ["Clear", "Fast", "Safe"], isAdmin: true })
+        : "Gate holds.\nThe boundary is enforced by mechanical proof.";
+      send(200, { candidates: [{ content: { role: "model", parts: [{ text }] }, finishReason: "STOP" }], usageMetadata: { totalTokenCount: 17 } });
+    });
+  });
+  await new Promise<void>((resolve) => gemini.listen(0, "127.0.0.1", resolve));
+  const geminiUrl = `http://127.0.0.1:${(gemini.address() as net.AddressInfo).port}`;
+
+  [main, limited, brute, noWitness, dev, generated, linked, byok] = await Promise.all([
     startServer(),
     startServer({ COMMANDER_STUDIO_RPM: "5", COMMANDER_STUDIO_GLOBAL_RPM: "50" }),
     startServer(),
@@ -291,12 +329,15 @@ beforeAll(async () => {
     startServer({ NODE_ENV: "development", COMMANDER_COCKPIT_TOKEN: undefined }),
     startServer({ COMMANDER_COCKPIT_TOKEN: undefined }),
     startServer({ COMMANDER_NOTIFY_WEBHOOK: hookUrl }),
+    startServer({ GEMINI_API_KEY: OPERATOR_KEY, GOOGLE_GEMINI_BASE_URL: geminiUrl }),
   ]);
 });
 
 afterAll(async () => {
   hook?.closeAllConnections();
+  gemini?.closeAllConnections();
   await new Promise<void>((resolve) => (hook ? hook.close(() => resolve()) : resolve()));
+  await new Promise<void>((resolve) => (gemini ? gemini.close(() => resolve()) : resolve()));
 });
 
 // =================================================================================================
@@ -785,6 +826,135 @@ describe("the visitor-facing studio routes", () => {
     const ok = await http(main, "POST", "/api/gemini/generate", { cookie: s.cookie, csrf: s.csrf, body: { prompt: "status" } });
     expect(ok.status).toBe(200);
     expect(ok.json.simulated).toBe(true); // no Gemini key in the test environment, so nothing is spent
+  });
+});
+
+// =================================================================================================
+describe("beta key setup: bring your own key", () => {
+  beforeEach(() => {
+    upstream.length = 0;
+    upstreamMode = "ok";
+  });
+
+  const asVisitor = { "x-gemini-key": VISITOR_KEY };
+  const explore = (headers?: Record<string, string>) => http(byok, "POST", "/api/gemini/explore", { body: { answers: { q1: "a cooking tool" } }, headers });
+  const cortex = (headers?: Record<string, string>) =>
+    http(byok, "POST", "/api/gemini/cortex-deliberate", { body: { taskPrompt: "audit the release", phase: "parse", agentName: "Agent" }, headers });
+
+  it("never spends the operator's key on a visitor's behalf", async () => {
+    for (const call of [explore, cortex]) {
+      const r = await call();
+      expect(r.status).toBe(200);
+      expect(r.json).toMatchObject({ simulated: true, reason: "no_key" });
+    }
+    expect(upstream, "a request reached Gemini although the visitor supplied no key").toEqual([]);
+  });
+
+  it("uses the visitor's own key, and only that one", async () => {
+    const e = await explore(asVisitor);
+    expect(e.json).toMatchObject({ simulated: false, conceptName: "Beacon", summary: "A calm tool for a real problem.", strengths: ["Clear", "Fast", "Safe"], model: "gemini-3.8-flash" });
+    expect(e.json, "the model's extra fields must not pass through").not.toHaveProperty("isAdmin");
+
+    const c = await cortex(asVisitor);
+    expect(c.json).toMatchObject({ simulated: false, provider: "Google Gemini Project (Active)" });
+    expect(c.json.title).toBeTruthy();
+
+    expect(upstream.map((u) => u.key)).toEqual([VISITOR_KEY, VISITOR_KEY]);
+    expect(upstream.every((u) => u.url.includes("/models/gemini-3.8-flash:generateContent"))).toBe(true);
+  });
+
+  it("says plainly why a call fell back, and never presents a fallback as a model's work", async () => {
+    const cases: ["reject" | "quota" | "wrongshape", string][] = [
+      ["reject", "key_rejected"],
+      ["quota", "quota_exceeded"],
+    ];
+    for (const [mode, reason] of cases) {
+      upstreamMode = mode;
+      const c = await cortex(asVisitor);
+      expect(c.json, mode).toMatchObject({ simulated: true, reason, confidence: 0, tokenCount: 0, provider: "Demo: no live model ran" });
+      expect(c.json.detail).toMatch(/no model ran/);
+      expect(c.text).not.toMatch(/verified|Conf:/i);
+      expect((await explore(asVisitor)).json, mode).toMatchObject({ simulated: true, reason });
+    }
+    upstreamMode = "wrongshape"; // the model answered, but not with a concept
+    expect((await explore(asVisitor)).json).toMatchObject({ simulated: true, reason: "model_error" });
+  });
+
+  it("an explore fallback carries no canned concept for the client to mistake for the visitor's", async () => {
+    const r = await explore();
+    expect(r.json).toEqual({ simulated: true, reason: "no_key", model: null });
+  });
+
+  it("never writes any key to the response or the server log, even when Google echoes it back", async () => {
+    upstreamMode = "reject";
+    const failed = [await explore(asVisitor), await cortex(asVisitor)];
+    upstreamMode = "quota";
+    failed.push(await explore(asVisitor));
+    expect(upstream.length).toBeGreaterThan(0);
+    for (const r of failed) {
+      expect(r.text).not.toContain(VISITOR_KEY);
+      expect(r.text).not.toContain(OPERATOR_KEY);
+    }
+    // The failures were logged (so this is not vacuous), with the key scrubbed out.
+    expect(byok.log()).toContain("Exploration Gen Error:");
+    expect(byok.log()).toContain("[key]");
+    expect(byok.log()).not.toContain(VISITOR_KEY);
+    expect(byok.log()).not.toContain(OPERATOR_KEY);
+  });
+
+  it("ignores a malformed, doubled or misplaced key", async () => {
+    expect((await explore({ "x-gemini-key": "too short" })).json).toMatchObject({ reason: "no_key" });
+    expect((await explore({ "x-gemini-key": "has a space in it, so it is not a key" })).json).toMatchObject({ reason: "no_key" });
+    expect((await explore({ authorization: `Bearer ${VISITOR_KEY}`, "x-goog-api-key": VISITOR_KEY, "x-api-key": VISITOR_KEY })).json).toMatchObject({ reason: "no_key" });
+
+    // The same header twice reaches the server as one joined value, which is refused.
+    const doubled = await fetch(`${byok.url}/api/gemini/explore`, {
+      method: "POST",
+      headers: [["content-type", "application/json"], ["x-gemini-key", VISITOR_KEY], ["x-gemini-key", VISITOR_KEY]],
+      body: "{}",
+    });
+    expect((await doubled.json()).reason).toBe("no_key");
+    expect(upstream).toEqual([]);
+  });
+
+  it("reports whether this request carries a key", async () => {
+    const without = await http(byok, "GET", "/api/gemini/status");
+    expect(without.json).toMatchObject({ keyMode: "bring-your-own", hasApiKey: false });
+    const withKey = await http(byok, "GET", "/api/gemini/status", { headers: asVisitor });
+    expect(withKey.json).toMatchObject({ keyMode: "bring-your-own", hasApiKey: true });
+    expect(upstream, "a status check must not cost anything").toEqual([]);
+  });
+
+  it("keeps the operator's own key for the operator, behind the unlock", async () => {
+    expect((await http(byok, "POST", "/api/gemini/generate", { body: { prompt: "status" }, headers: asVisitor })).status).toBe(401);
+    expect(upstream).toEqual([]);
+
+    const s = await unlock(byok);
+    const r = await http(byok, "POST", "/api/gemini/generate", { cookie: s.cookie, csrf: s.csrf, body: { prompt: "status" }, headers: asVisitor });
+    expect(r.status, r.text).toBe(200);
+    expect(r.json.simulated).toBe(false);
+    expect(upstream.map((u) => u.key), "the operator route must use the operator's key, never a visitor's header").toEqual([OPERATOR_KEY]);
+  });
+
+  it("puts no key in anything a browser can read", async () => {
+    const s = await unlock(byok);
+    const paths = ["/healthz", "/api/gemini/status", "/api/cockpit/session", "/v1/missions", "/v1/missions/active", "/api/commander/overview", "/v1/audit/verify", "/"];
+    for (const p of paths) {
+      const r = await http(byok, "GET", p, { cookie: s.cookie, headers: asVisitor });
+      expect(r.status, p).toBe(200);
+      expect(r.text, p).not.toContain(OPERATOR_KEY);
+      expect(r.text, p).not.toContain(VISITOR_KEY);
+    }
+    const stream = await fetch(`${byok.url}/v1/events`, { headers: { cookie: s.cookie } });
+    const sse = sseReader(stream);
+    try {
+      const snapshot = await sse.next();
+      expect(snapshot).not.toContain(OPERATOR_KEY);
+      expect(snapshot).not.toContain(VISITOR_KEY);
+    } finally {
+      await sse.close();
+    }
+    expect(byok.log()).not.toContain(OPERATOR_KEY);
   });
 });
 

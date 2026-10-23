@@ -13,6 +13,7 @@ import type {
   CortexToolCall,
 } from "./types";
 import { cortexBus } from "./bus";
+import { withGeminiKey } from "../byok";
 
 export const SCENARIOS: Record<CortexScenarioId, CortexScenario> = {
   codebase_synthesis: {
@@ -417,7 +418,7 @@ export class CortexSimulator {
     if (typeof fetch !== "undefined") {
       fetch("/api/gemini/cortex-deliberate", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: withGeminiKey({ "Content-Type": "application/json" }),
         body: JSON.stringify({
           taskPrompt: promptText,
           phase: "parse",
@@ -431,21 +432,24 @@ export class CortexSimulator {
               id: `step-gemini-${Date.now()}`,
               phase: "plan",
               agentId: "orch-01",
-              agentName: "Google Gemini Project (gemini-3.8-flash)",
+              agentName: data.simulated ? "Demo (no live model)" : "Google Gemini Project (gemini-3.8-flash)",
               title: data.title,
               detail: data.detail,
-              confidence: data.confidence || 0.95,
+              confidence: data.simulated ? 0 : data.confidence || 0.95,
               threshold: 0.85,
               timestamp: Date.now(),
               tokenCount: data.tokenCount || 320,
               worldCoord: [1.8, 0.4, -0.6],
             };
             cortexBus.emitReasoningStep(geminiStep);
-            cortexBus.emitMetricsUpdate({
-              provider: "Google Gemini Project (gemini-3.8-flash)",
-              modelName: "gemini-3.8-flash",
-              consensusScore: 0.96,
-            });
+            // A demo result must not relabel the dashboard as running on a live model.
+            if (!data.simulated) {
+              cortexBus.emitMetricsUpdate({
+                provider: "Google Gemini Project (gemini-3.8-flash)",
+                modelName: "gemini-3.8-flash",
+                consensusScore: 0.96,
+              });
+            }
           }
         })
         .catch(() => {
