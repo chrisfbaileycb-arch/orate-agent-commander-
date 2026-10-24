@@ -139,6 +139,11 @@ The forge is paired with **Agent Commander**, a control plane that sits above th
 workflow advance without mechanical proof. The design is in [`docs/COMMANDER.md`](docs/COMMANDER.md) and
 [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md); the engine is `src/commander/`, and `server.ts` serves it.
 
+**Origin.** The engine began as the standalone [`commander-agent`](https://github.com/chrisfbaileycb-arch/commander-agent)
+project, was combined with the Orator in AI Studio, and was refactored here. **This repository is now the source of
+truth.** Changes made since the merge, including the security, guard and key-handling fixes described below, exist only
+here; `commander-agent` does not have them.
+
 - **The operator cockpit is locked.** The server log prints an unlock token for the run (or set
   `COMMANDER_COCKPIT_TOKEN`). Visitors get the Orator pages and clearly labelled demos; nothing that carries operator
   authority is reachable without the token. In development, with no token of your own set, a browser on the same machine

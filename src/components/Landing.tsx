@@ -396,9 +396,13 @@ export default function Landing(_props: Props) {
 
           {/* Operator unlock: visitors see the labelled demo, an operator unlocks the live cockpit */}
           {cockpitLocked && (
+            <details data-testid="cockpit-unlock-details" className="text-xs open:basis-full">
+            <summary className="inline-flex cursor-pointer list-none items-center rounded-md border border-slate-500 bg-slate-950 px-2.5 py-1 font-bold tracking-wider uppercase text-slate-200 focus:outline-none focus-visible:ring-2 focus-visible:ring-cyan-400 [&::-webkit-details-marker]:hidden">
+              Operator unlock
+            </summary>
             <form
               data-testid="cockpit-unlock-form"
-              className="inline-flex flex-wrap items-center gap-1.5"
+              className="mt-2 inline-flex flex-wrap items-center gap-1.5"
               onSubmit={async (e) => {
                 e.preventDefault();
                 if (await unlockCockpit(unlockToken.trim())) setUnlockToken("");
@@ -428,6 +432,7 @@ export default function Landing(_props: Props) {
                 </span>
               )}
             </form>
+            </details>
           )}
 
           {/* Header Status Pill Strictly Bound to Live Mission State */}

@@ -28,8 +28,9 @@ check itself.
 
 | Blueprint component | Where |
 |---|---|
-The engine lives in `src/commander/` and is the only copy: `server.ts` imports it, and its tests sit beside it and run
-against exactly what ships. `server.ts` wraps it in the Express app (the cockpit UI, the security gate in
+The engine began as the standalone `commander-agent` project and now lives here, in `src/commander/`. **This repository
+is the source of truth**; the original does not have the fixes made since the merge. It is the only copy in this
+repository: `server.ts` imports it, and its tests sit beside it and run against exactly what ships. `server.ts` wraps it in the Express app (the cockpit UI, the security gate in
 `src/server/security.ts`, the MCP endpoint, the REST APIs).
 
 | Blueprint component | Where |
