@@ -4,6 +4,8 @@ import type { ScarcityTelemetry } from "../lib/types";
 import type { DesignExploration } from "../lib/exploration-types";
 import CortexTorus3D, { type AirlockSphereState } from "./cortex/CortexTorus3D";
 import LivingBuildTree from "./LivingBuildTree";
+import ByokKeyControl from "./ByokKeyControl";
+import { LEDGER_QUERY_UNREACHABLE, ledgerQueryOutcome } from "../lib/ledger-query";
 import SlideOverAppViewport from "./SlideOverAppViewport";
 import { orate, hush, listen, listeningSupported, type ListenHandle } from "../lib/voice";
 import {
@@ -98,10 +100,15 @@ export default function Landing(_props: Props) {
     isDemoSimulation,
     sseConnected,
     isBusy,
+    cockpitLocked,
+    unlockError,
+    unlockCockpit,
+    getCsrfToken,
     executeDecision,
     triggerLifecycleAction,
   } = useCommanderEngine();
 
+  const [unlockToken, setUnlockToken] = useState("");
   const [redirectNote, setRedirectNote] = useState("");
   const [showRedirectInput, setShowRedirectInput] = useState(false);
   const [ledgerReply, setLedgerReply] = useState<string | null>(null);
@@ -319,26 +326,28 @@ export default function Landing(_props: Props) {
     try {
       const response = await fetch("/api/orator/chat", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        // The cockpit gate requires this session's CSRF token on every state-changing request.
+        headers: { "Content-Type": "application/json", "x-csrf-token": getCsrfToken() },
         body: JSON.stringify({
           userMessage: textToSend,
         }),
       });
 
-      const data = await response.json();
-      const commanderReply =
-        data?.reply ||
-        "Ledger query complete. Only mechanical proof advances the step-gated airlock.";
+      let data: unknown = null;
+      try {
+        data = await response.json();
+      } catch {
+        /* an error page, not JSON: the status below still says what happened */
+      }
+      const commanderReply = ledgerQueryOutcome(response.status, data).text;
 
       setIsOratorThinking(false);
       setLedgerReply(commanderReply);
       await speakCommanderLine(commanderReply);
     } catch {
       setIsOratorThinking(false);
-      const fallback =
-        "Ledger query channel standing by. Refer to live mission telemetry above.";
-      setLedgerReply(fallback);
-      await speakCommanderLine(fallback);
+      setLedgerReply(LEDGER_QUERY_UNREACHABLE);
+      await speakCommanderLine(LEDGER_QUERY_UNREACHABLE);
     }
   };
 
@@ -383,6 +392,50 @@ export default function Landing(_props: Props) {
               />
               {sseConnected ? "LIVE ENGINE · SSE" : "LIVE ENGINE · HTTP"}
             </span>
+          )}
+
+          {/* Beta key setup: a tester brings their own Gemini key; without one the studio answers with labelled demo results */}
+          <ByokKeyControl />
+
+          {/* Operator unlock: visitors see the labelled demo, an operator unlocks the live cockpit */}
+          {cockpitLocked && (
+            <details data-testid="cockpit-unlock-details" className="text-xs open:basis-full">
+            <summary className="inline-flex cursor-pointer list-none items-center rounded-md border border-slate-500 bg-slate-950 px-2.5 py-1 font-bold tracking-wider uppercase text-slate-200 focus:outline-none focus-visible:ring-2 focus-visible:ring-cyan-400 [&::-webkit-details-marker]:hidden">
+              Operator unlock
+            </summary>
+            <form
+              data-testid="cockpit-unlock-form"
+              className="mt-2 inline-flex flex-wrap items-center gap-1.5"
+              onSubmit={async (e) => {
+                e.preventDefault();
+                if (await unlockCockpit(unlockToken.trim())) setUnlockToken("");
+              }}
+            >
+              <input
+                data-testid="cockpit-unlock-input"
+                type="password"
+                autoComplete="off"
+                spellCheck={false}
+                value={unlockToken}
+                onChange={(e) => setUnlockToken(e.target.value)}
+                placeholder="Operator unlock token"
+                aria-label="Operator unlock token"
+                className="w-44 rounded-md border border-slate-600 bg-slate-950 px-2 py-0.5 text-xs text-slate-100 placeholder:text-slate-500 focus:border-cyan-400 focus:outline-none"
+              />
+              <button
+                type="submit"
+                disabled={unlockToken.trim().length === 0}
+                className="rounded-md border border-cyan-500/70 bg-cyan-950/70 px-2.5 py-0.5 text-xs font-bold tracking-wider uppercase text-cyan-100 disabled:opacity-40"
+              >
+                Unlock live cockpit
+              </button>
+              {unlockError && (
+                <span role="alert" className="text-xs text-red-300">
+                  {unlockError}
+                </span>
+              )}
+            </form>
+            </details>
           )}
 
           {/* Header Status Pill Strictly Bound to Live Mission State */}

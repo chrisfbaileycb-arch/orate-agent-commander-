@@ -40,6 +40,20 @@ export function stripAnsi(s: string): string {
   return s.replace(ANSI, '');
 }
 
+/**
+ * Settles within `ms` whatever the call does. Handing the call an abort signal as well cancels the underlying request,
+ * but the deadline must not depend on the callee honouring it: a hung model call would hold its caller open indefinitely.
+ */
+export function withDeadline<T>(call: Promise<T>, ms: number): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const deadline = new Promise<never>((_resolve, reject) => {
+    timer = setTimeout(() => reject(new Error('timed out')), ms);
+  });
+  // If the deadline wins, a late failure from the abandoned call must not surface as an unhandled rejection.
+  call.catch(() => undefined);
+  return Promise.race([call, deadline]).finally(() => clearTimeout(timer));
+}
+
 /** POSIX single-quote an argument so an argv array can be rendered as one shell line for static analysis. */
 export function shellQuote(arg: string): string {
   return /^[\w@%+=:,./-]+$/.test(arg) ? arg : `'${arg.replace(/'/g, `'\\''`)}'`;

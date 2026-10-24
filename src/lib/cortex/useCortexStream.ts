@@ -14,6 +14,7 @@ import type {
   CortexStreamEvent,
 } from "./types";
 import { cortexBus } from "./bus";
+import { withGeminiKey } from "../byok";
 import { cortexSimulator, SCENARIOS } from "./simulator";
 import { cortexAudio } from "./audio";
 
@@ -51,7 +52,7 @@ export function useCortexStream() {
   // Verify server-side Gemini Project connectivity on mount
   useEffect(() => {
     if (typeof fetch !== "undefined") {
-      fetch("/api/gemini/status")
+      fetch("/api/gemini/status", { headers: withGeminiKey() })
         .then((res) => res.json())
         .then((data) => {
           if (data?.defaultProvider) {

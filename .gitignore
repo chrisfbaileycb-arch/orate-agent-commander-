@@ -7,8 +7,13 @@ __pycache__/
 .env.*
 !.env.example
 
+# Agent Commander persistence (COMMANDER_DATA_DIR): the ledger and approval state, not source
+data/
+
 # Node / Vite
 node_modules/
+# bun.lock is the project's lockfile; a second one from `npm install` would drift from it
+package-lock.json
 dist/
 *.local
 *.tsbuildinfo

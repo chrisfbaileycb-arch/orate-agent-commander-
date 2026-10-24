@@ -2,7 +2,7 @@ import { GoogleGenAI, Type } from '@google/genai';
 import { z } from 'zod';
 import { redactSecrets } from './inquisitor.js';
 import type { ActionRequest, Finding } from './types.js';
-import { sanitizeLine } from './util.js';
+import { sanitizeLine, withDeadline } from './util.js';
 
 /**
  * Frontier Reasoning Interceptor Gate.
@@ -13,7 +13,8 @@ import { sanitizeLine } from './util.js';
  * boundary. The deterministic rules in sentinel.ts are the boundary.
  */
 
-export type GateVerdict = 'allow' | 'stage' | 'deny';
+const VERDICTS = ['allow', 'stage', 'deny'] as const;
+export type GateVerdict = (typeof VERDICTS)[number];
 
 export interface GateInput {
   stepTitle: string;
@@ -54,29 +55,37 @@ const SYSTEM = [
   'Reply with JSON: {"verdict": "allow"|"stage"|"deny", "rationale": "<one sentence>"}.',
 ].join(' ');
 
-const ReplySchema = z.object({ verdict: z.enum(['allow', 'stage', 'deny']), rationale: z.string() });
+const ReplySchema = z.object({ verdict: z.enum(VERDICTS), rationale: z.string() });
+
+/** The part of the SDK the gate uses, so a test can stand in for it without a network. */
+export type GateClient = { models: Pick<GoogleGenAI['models'], 'generateContent'> };
 
 export interface GeminiGateOptions {
   apiKey: string;
-  /** Model id is deployment configuration, not a constant of this codebase. */
+  /** Model id is deployment configuration (COMMANDER_GEMINI_MODEL), not a constant of this codebase. */
   model: string;
-  fetchImpl?: typeof fetch;
+  /** Replaces the SDK client. For tests. */
+  client?: GateClient;
   timeoutMs?: number;
 }
 
+const DEFAULT_TIMEOUT_MS = 8000;
+
 export class GeminiGate implements ReasoningGate {
   readonly active = true;
-  private readonly ai: GoogleGenAI;
+  private readonly client: GateClient;
 
   constructor(private readonly opts: GeminiGateOptions) {
-    this.ai = new GoogleGenAI({
-      apiKey: opts.apiKey,
-      httpOptions: {
-        headers: {
-          'User-Agent': 'aistudio-build',
+    this.client =
+      opts.client ??
+      new GoogleGenAI({
+        apiKey: opts.apiKey,
+        httpOptions: {
+          headers: {
+            'User-Agent': 'aistudio-build',
+          },
         },
-      },
-    });
+      });
   }
 
   async review(input: GateInput): Promise<GateOutput> {
@@ -88,53 +97,34 @@ export class GeminiGate implements ReasoningGate {
       `<untrusted>${redactSecrets(input.action.payload).slice(0, 2000)}</untrusted>`,
     ].join('\n');
 
+    const timeoutMs = this.opts.timeoutMs ?? DEFAULT_TIMEOUT_MS;
     try {
-      if (this.opts.fetchImpl) {
-        const res = await this.opts.fetchImpl(
-          `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(this.opts.model)}:generateContent`,
-          {
-            method: 'POST',
-            headers: { 'content-type': 'application/json', 'x-goog-api-key': this.opts.apiKey },
-            body: JSON.stringify({
-              systemInstruction: { parts: [{ text: SYSTEM }] },
-              contents: [{ role: 'user', parts: [{ text: prompt }] }],
-              generationConfig: {
-                temperature: 0,
-                responseMimeType: 'application/json',
+      const response = await withDeadline(
+        this.client.models.generateContent({
+          model: this.opts.model,
+          contents: prompt,
+          config: {
+            systemInstruction: SYSTEM,
+            temperature: 0,
+            responseMimeType: 'application/json',
+            responseSchema: {
+              type: Type.OBJECT,
+              properties: {
+                verdict: { type: Type.STRING, enum: [...VERDICTS] },
+                rationale: { type: Type.STRING },
               },
-            }),
-            signal: AbortSignal.timeout(this.opts.timeoutMs ?? 8000),
-          },
-        );
-        if (!res.ok) throw new Error(`gate responded ${res.status}`);
-        const body = (await res.json()) as { candidates?: { content?: { parts?: { text?: string }[] } }[] };
-        const text = body.candidates?.[0]?.content?.parts?.[0]?.text;
-        if (!text) throw new Error('gate returned no content');
-        return ReplySchema.parse(JSON.parse(text));
-      }
-
-      const response = await this.ai.models.generateContent({
-        model: this.opts.model || 'gemini-3.8-flash',
-        contents: prompt,
-        config: {
-          systemInstruction: SYSTEM,
-          temperature: 0,
-          responseMimeType: 'application/json',
-          responseSchema: {
-            type: Type.OBJECT,
-            properties: {
-              verdict: { type: Type.STRING },
-              rationale: { type: Type.STRING },
+              required: ['verdict', 'rationale'],
             },
-            required: ['verdict', 'rationale'],
+            abortSignal: AbortSignal.timeout(timeoutMs),
           },
-        },
-      });
+        }),
+        timeoutMs,
+      );
       const text = response.text;
       if (!text) throw new Error('gate returned no content');
       return ReplySchema.parse(JSON.parse(text));
     } catch {
-      // An unreachable or malformed gate must never read as approval. Defer to the human.
+      // An unreachable, slow or malformed gate must never read as approval. Defer to the human.
       return { verdict: 'stage', rationale: 'Reasoning gate unavailable. Deferring to operator.' };
     }
   }
