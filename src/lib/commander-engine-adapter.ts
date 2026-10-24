@@ -502,6 +502,8 @@ export interface UseCommanderEngineResult {
   cockpitLocked: boolean;
   unlockError: string | null;
   unlockCockpit: (token: string) => Promise<boolean>;
+  /** This session's CSRF token, for any other state-changing cockpit request. Empty until the cockpit is unlocked. */
+  getCsrfToken: () => string;
   refreshMission: (missionId?: string) => Promise<void>;
   refreshAudit: () => Promise<void>;
   executeDecision: (
@@ -886,6 +888,7 @@ export function useCommanderEngine(): UseCommanderEngineResult {
     cockpitLocked,
     unlockError,
     unlockCockpit,
+    getCsrfToken: () => csrfTokenRef.current,
     refreshMission,
     refreshAudit,
     executeDecision,

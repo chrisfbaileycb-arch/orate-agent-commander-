@@ -5,6 +5,7 @@ import type { DesignExploration } from "../lib/exploration-types";
 import CortexTorus3D, { type AirlockSphereState } from "./cortex/CortexTorus3D";
 import LivingBuildTree from "./LivingBuildTree";
 import ByokKeyControl from "./ByokKeyControl";
+import { LEDGER_QUERY_UNREACHABLE, ledgerQueryOutcome } from "../lib/ledger-query";
 import SlideOverAppViewport from "./SlideOverAppViewport";
 import { orate, hush, listen, listeningSupported, type ListenHandle } from "../lib/voice";
 import {
@@ -102,6 +103,7 @@ export default function Landing(_props: Props) {
     cockpitLocked,
     unlockError,
     unlockCockpit,
+    getCsrfToken,
     executeDecision,
     triggerLifecycleAction,
   } = useCommanderEngine();
@@ -324,27 +326,28 @@ export default function Landing(_props: Props) {
     try {
       const response = await fetch("/api/orator/chat", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        // The cockpit gate requires this session's CSRF token on every state-changing request.
+        headers: { "Content-Type": "application/json", "x-csrf-token": getCsrfToken() },
         body: JSON.stringify({
           userMessage: textToSend,
         }),
       });
 
-      const data = await response.json();
-      const commanderReply =
-        (response.status === 401 ? "Cockpit locked. Unlock the live cockpit to query the ledger." : undefined) ||
-        data?.reply ||
-        "Ledger query complete. Only mechanical proof advances the step-gated airlock.";
+      let data: unknown = null;
+      try {
+        data = await response.json();
+      } catch {
+        /* an error page, not JSON: the status below still says what happened */
+      }
+      const commanderReply = ledgerQueryOutcome(response.status, data).text;
 
       setIsOratorThinking(false);
       setLedgerReply(commanderReply);
       await speakCommanderLine(commanderReply);
     } catch {
       setIsOratorThinking(false);
-      const fallback =
-        "Ledger query channel standing by. Refer to live mission telemetry above.";
-      setLedgerReply(fallback);
-      await speakCommanderLine(fallback);
+      setLedgerReply(LEDGER_QUERY_UNREACHABLE);
+      await speakCommanderLine(LEDGER_QUERY_UNREACHABLE);
     }
   };
 

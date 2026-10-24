@@ -486,6 +486,18 @@ describe("unlocking the operator cockpit", () => {
     expect((await reset(mine.csrf)).status).toBe(200);
   });
 
+  it("needs the session's CSRF token on the ledger chat routes too, and answers once it is sent", async () => {
+    const s = await unlock(main);
+    for (const route of ["/api/orator/chat", "/api/commander/chat"]) {
+      const without = await http(main, "POST", route, { cookie: s.cookie, body: { userMessage: "status" } });
+      expect(without.status, `${route} without the token`).toBe(403);
+      const withToken = await http(main, "POST", route, { cookie: s.cookie, csrf: s.csrf, body: { userMessage: "status" } });
+      expect(withToken.status, `${route} with the token: ${withToken.text}`).toBe(200);
+      expect(typeof withToken.json.reply, route).toBe("string");
+      expect(withToken.json.reply.length, route).toBeGreaterThan(0);
+    }
+  });
+
   it("ends the session on logout", async () => {
     const s = await unlock(main);
     expect((await http(main, "GET", "/v1/missions", { cookie: s.cookie })).status).toBe(200);
