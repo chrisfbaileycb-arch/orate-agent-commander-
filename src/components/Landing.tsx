@@ -7,6 +7,8 @@ import LivingBuildTree from "./LivingBuildTree";
 import ByokKeyControl from "./ByokKeyControl";
 import { LEDGER_QUERY_UNREACHABLE, ledgerQueryOutcome } from "../lib/ledger-query";
 import SlideOverAppViewport from "./SlideOverAppViewport";
+import AgentSupervisionManual from "./AgentSupervisionManual";
+import { getDefaultCoverPageOpen } from "../lib/supervision-manual";
 import { orate, hush, listen, listeningSupported, type ListenHandle } from "../lib/voice";
 import {
   deriveProvenanceBadge,
@@ -87,7 +89,9 @@ const SPHERE_STATE_META: Record<
 };
 
 export default function Landing(_props: Props) {
-  const [currentAct, setCurrentAct] = useState<"audience" | "weave" | "reveal">("audience");
+  const [currentAct, setCurrentAct] = useState<"manual" | "audience" | "weave" | "reveal">(() =>
+    getDefaultCoverPageOpen() ? "manual" : "audience"
+  );
 
   // Live Engine Adapter connected to GET /v1/missions/:id, GET /v1/audit/verify, and SSE /v1/events
   const {
@@ -448,8 +452,39 @@ export default function Landing(_props: Props) {
           </span>
         </div>
 
-        {/* Live Engine State Transitions */}
+        {/* View Switcher (Cover Page Manual / Live HUD Cockpit) + Live Engine State Transitions */}
         <div className="flex flex-wrap items-center gap-1.5">
+          <button
+            type="button"
+            data-testid="nav-cover-manual-btn"
+            onClick={() => setCurrentAct("manual")}
+            className={`px-2.5 py-1 rounded border text-xs font-bold tracking-wider uppercase transition ${
+              currentAct === "manual"
+                ? "border-cyan-400 bg-cyan-950/90 text-cyan-100 shadow-[0_0_12px_rgba(53,224,255,0.25)]"
+                : "border-slate-700 bg-[#090e18] text-slate-200 hover:border-cyan-400 hover:text-white"
+            }`}
+            title="Open Agent Platform Supervision Manual & Cover Page"
+          >
+            Cover Page & Manual
+          </button>
+          <button
+            type="button"
+            data-testid="nav-hud-cockpit-btn"
+            onClick={() => setCurrentAct("audience")}
+            className={`px-2.5 py-1 rounded border text-xs font-bold tracking-wider uppercase transition ${
+              currentAct === "audience"
+                ? "border-cyan-400 bg-cyan-950/90 text-cyan-100 shadow-[0_0_12px_rgba(53,224,255,0.25)]"
+                : "border-slate-700 bg-[#090e18] text-slate-200 hover:border-cyan-400 hover:text-white"
+            }`}
+            title="Open Live 3D Neural Sphere & Agent Commander HUD Cockpit"
+          >
+            Live HUD Cockpit
+          </button>
+
+          <span aria-hidden="true" className="text-slate-700 px-0.5">
+            |
+          </span>
+
           <button
             type="button"
             onClick={() => void handleLifecycleAction("idle")}
@@ -517,6 +552,24 @@ export default function Landing(_props: Props) {
           </button>
         </div>
       </header>
+
+      {/* ========================================================================= */}
+      {/* ACT 0: COVER PAGE & AGENT PLATFORM SUPERVISION MANUAL                     */}
+      {/* ========================================================================= */}
+      {currentAct === "manual" && (
+        <AgentSupervisionManual
+          activeMissionId={mission?.id ?? "msn_active_cutover"}
+          activeMissionTitle={mission?.title ?? "Release 4.2 · Sovereign Production Cutover"}
+          sphereState={sphereState}
+          auditCount={audit?.count ?? 0}
+          auditVerified={audit?.ok !== false}
+          pendingGateCount={pendingGateCount}
+          isDemoSimulation={isDemoSimulation}
+          onEnterCockpit={() => setCurrentAct("audience")}
+          onEnterWeave={() => setCurrentAct("weave")}
+          onTriggerLifecycle={(action) => void handleLifecycleAction(action)}
+        />
+      )}
 
       {/* ========================================================================= */}
       {/* ACT I: 3D NEURAL SPHERE + AGENT COMMANDER HUD COCKPIT                     */}
@@ -961,14 +1014,14 @@ export default function Landing(_props: Props) {
                   </div>
                 </div>
 
-                {/* Secondary Action to Re-seed or View Pipeline Weave */}
+                {/* Secondary Action to Open Supervision Manual or View Pipeline Weave */}
                 <div className="pt-1.5 border-t border-slate-700/70 flex items-center justify-between text-xs">
                   <button
                     type="button"
-                    onClick={() => void handleLifecycleAction("native_intercept")}
+                    onClick={() => setCurrentAct("manual")}
                     className="text-slate-300 hover:text-white font-semibold transition"
                   >
-                    Re-stage Gate
+                    ← Supervision Manual
                   </button>
                   <button
                     type="button"

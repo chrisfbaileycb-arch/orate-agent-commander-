@@ -50,6 +50,7 @@ repository: `server.ts` imports it, and its tests sit beside it and run against 
 | Tamper-evident audit ledger (hash-chained per tenant) | `src/commander/store.ts` |
 | Deny-by-default route gate, cockpit sessions, rate limits | `src/server/security.ts` |
 | Beta key setup: visitors bring their own Gemini key | `src/lib/byok.ts`, `src/server/byok.ts` |
+| Interactive Cover Page & Agent Supervision Manual | `src/components/AgentSupervisionManual.tsx`, `src/lib/supervision-manual.ts`, `docs/AGENT_SUPERVISION_MANUAL.md` |
 
 `src/commander/http.ts` and `src/commander/hud/` are the engine's original standalone HTTP front end and dashboard. They
 are still exercised by the tests but `server.ts` does not use them.

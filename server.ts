@@ -2034,9 +2034,11 @@ async function startServer() {
     app.use(vite.middlewares);
   } else {
     const distPath = path.resolve(process.cwd(), "dist");
+    const distIndex = path.join(distPath, "index.html");
+    const rootIndex = path.resolve(process.cwd(), "index.html");
     app.use(express.static(distPath));
     app.use((_req, res) => {
-      res.sendFile(path.join(distPath, "index.html"));
+      res.sendFile(fs.existsSync(distIndex) ? distIndex : rootIndex);
     });
   }
 
