@@ -246,7 +246,7 @@ export class Airlock {
     return missionView(lookup(this.state.missions, id, p.tenantId));
   }
 
-  intervene(p: Principal, id: string, input: { action: 'kill' | 'skip'; reason: string }): ReturnType<typeof missionView> {
+  intervene(p: Principal, id: string, input: { action: 'kill' | 'skip'; reason: string; step_id?: string }): ReturnType<typeof missionView> {
     this.d.auth.requireRole(p, 'operator');
     const m = lookup(this.state.missions, id, p.tenantId);
     if (m.status === 'killed' || m.status === 'completed') throw new CommanderError('CONFLICT', say.conflict('Mission is already closed.'));
@@ -257,13 +257,15 @@ export class Airlock {
       this.killMission(m, `operator:${p.keyId}`, reason);
       return missionView(m);
     }
-    const step = m.steps[m.current]!;
+    const step = input.step_id ? m.steps.find((s) => s.id === input.step_id) : m.steps[m.current];
+    if (!step) throw new CommanderError('NOT_FOUND', 'Step not found.');
     if (step.status !== 'quarantined') throw new CommanderError('CONFLICT', say.conflict('Only a quarantined step may be skipped.'));
     step.status = 'skipped';
     this.settleApprovals(m, step, 'authorized', `Skipped by operator: ${reason}`, 'operator');
     m.manifests.push(`- **${sanitizeLine(step.def.title, 100)}** — skipped by operator without proof.`);
     this.d.store.audit(p.tenantId, 'step.skipped', { missionId: m.id, stepId: step.id, by: p.keyId, reason });
-    this.advance(m);
+    if (m.current === step.index || m.status === 'quarantined') this.advance(m);
+    else this.touchMission(m);
     return missionView(m);
   }
 
@@ -455,8 +457,11 @@ export class Airlock {
       });
       m.pausedFor = approval.id;
       this.d.store.audit(p.tenantId, 'step.quarantined', { missionId: m.id, stepId: step.id, approvalId: approval.id });
-      this.touchMission(m);
-      return { verdict: 'QUARANTINED', message: say.quarantined(), attempt: n, checks };
+      if (this.isGraph(m)) this.advance(m);
+      else this.touchMission(m);
+      return { verdict: 'QUARANTINED', message: (m.status as Mission['status']) === 'active'
+        ? 'Step quarantined. Independent work remains available; pull the next directive.'
+        : say.quarantined(), attempt: n, checks };
     }
 
     if (step.def.require_nonce) step.nonce = newId('nonce');
@@ -669,6 +674,11 @@ export class Airlock {
       throw new CommanderError('CONFLICT', say.conflict('Mission is already closed.'));
     }
 
+    const approvalStep = m.steps.find((s) => s.id === a.stepId);
+    if (!approvalStep || (a.kind === 'quarantine' && approvalStep.status !== 'quarantined')) {
+      throw new CommanderError('CONFLICT', say.conflict('Approval no longer matches a quarantined step.'));
+    }
+
     let cleanNote = note ? sanitizeLine(note, 400) : undefined;
     if (decision === 'redirect' && !cleanNote) cleanNote = 'Operator redirect. Re-plan the approach and proceed.';
     a.status = decision === 'authorize' ? 'authorized' : decision === 'redirect' ? 'redirected' : 'killed';
@@ -695,14 +705,19 @@ export class Airlock {
       const step = m.steps[m.current];
       if (step?.lease && !step.lease.revoked) step.lease.expiresAt = this.d.clock() + this.d.policy.lease_ttl_sec * 1000;
     } else {
-      const step = m.steps[m.current]!;
+      const step = approvalStep;
       step.attemptBudget += step.def.max_attempts;
-      step.status = 'released';
+      step.status = this.isGraph(m) ? 'locked' : 'released';
       step.lease = undefined;
       step.operatorPatch = decision === 'redirect' ? cleanNote : undefined;
       if (step.def.require_nonce) step.nonce = newId('nonce');
-      m.status = 'active';
-      m.pausedFor = undefined;
+      if (!this.isGraph(m)) {
+        m.status = 'active';
+        m.pausedFor = undefined;
+      } else if (m.status === 'quarantined') {
+        this.advance(m);
+      }
+      // An independent active lease or pending clearance keeps ownership of the mission.
     }
     this.touchMission(m);
     return a;
@@ -752,9 +767,13 @@ export class Airlock {
     this.d.store.touch();
   }
 
+  private isGraph(m: Mission): boolean {
+    return m.steps.some((s) => s.def.depends_on !== undefined);
+  }
+
   /** A graph remains single-flight: dependency order changes, worker lease semantics do not. */
   private readyStepIndex(m: Mission): number {
-    const graph = m.steps.some((s) => s.def.depends_on !== undefined);
+    const graph = this.isGraph(m);
     return m.steps.findIndex((step, index) => {
       if (step.status !== 'locked') return false;
       if (!graph) return m.steps.slice(0, index).every((s) => s.status === 'passed' || s.status === 'skipped');
@@ -778,6 +797,13 @@ export class Airlock {
     } else {
       // A skipped prerequisite may leave graph descendants blocked. Do not release them.
       m.status = 'quarantined';
+      const failed = m.steps.find((s) => s.status === 'quarantined');
+      if (failed) {
+        m.current = failed.index;
+        m.pausedFor = Object.values(this.state.approvals).find((a) =>
+          a.missionId === m.id && a.stepId === failed.id && a.kind === 'quarantine' && a.status === 'pending',
+        )?.id;
+      }
       this.d.store.audit(m.tenantId, 'mission.blocked', { missionId: m.id, reason: 'No verified dependency path is ready.' });
     }
     this.touchMission(m);
@@ -831,6 +857,7 @@ export function missionView(m: Mission) {
       dependency_id: s.def.id,
       depends_on: s.def.depends_on,
       status: s.status,
+      blocked_by: s.def.depends_on?.filter((id) => !m.steps.some((parent) => parent.def.id === id && parent.status === 'passed')) ?? [],
       risk_tier: s.def.risk_tier,
       attempt_budget: s.attemptBudget,
       attempts: s.attempts.map((a) => ({
