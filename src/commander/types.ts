@@ -87,6 +87,8 @@ export type RiskTier = z.infer<typeof RiskTierSchema>;
 
 export const StepDefSchema = z
   .object({
+    id: z.string().regex(/^[A-Za-z][A-Za-z0-9_-]{0,63}$/).optional(),
+    depends_on: z.array(z.string().min(1).max(64)).max(50).optional(),
     title: z.string().min(1).max(120),
     directive: z.string().min(1).max(8000),
     proof: z.array(VerifierSchema).min(1).max(20),
@@ -103,6 +105,41 @@ export type StepDef = z.infer<typeof StepDefSchema>;
 export const MissionDefSchema = z.object({
   title: z.string().min(1).max(160),
   steps: z.array(StepDefSchema).min(1).max(50),
+}).superRefine((mission, ctx) => {
+  // No dependency fields means the historical sequential contract.
+  if (!mission.steps.some((s) => s.depends_on !== undefined)) return;
+  const ids = new Map<string, number>();
+  const issue = (index: number, message: string) => ctx.addIssue({ code: 'custom', path: ['steps', index, 'depends_on'], message });
+  mission.steps.forEach((step, index) => {
+    if (!step.id) issue(index, 'Every graph step needs an id.');
+    else if (ids.has(step.id)) issue(index, `Duplicate step id: ${step.id}.`);
+    else ids.set(step.id, index);
+    if (step.depends_on === undefined) issue(index, 'Every graph step needs depends_on; use [] for a root.');
+  });
+  mission.steps.forEach((step, index) => {
+    const seen = new Set<string>();
+    for (const dep of step.depends_on ?? []) {
+      if (!ids.has(dep)) issue(index, `Unknown dependency: ${dep}.`);
+      if (dep === step.id) issue(index, 'A step cannot depend on itself.');
+      if (seen.has(dep)) issue(index, `Duplicate dependency: ${dep}.`);
+      seen.add(dep);
+    }
+  });
+  const visiting = new Set<number>();
+  const visited = new Set<number>();
+  const visit = (index: number): boolean => {
+    if (visiting.has(index)) return true;
+    if (visited.has(index)) return false;
+    visiting.add(index);
+    for (const dep of mission.steps[index].depends_on ?? []) {
+      const parent = ids.get(dep);
+      if (parent !== undefined && visit(parent)) return true;
+    }
+    visiting.delete(index);
+    visited.add(index);
+    return false;
+  };
+  if (mission.steps.some((_, index) => visit(index))) issue(0, 'Dependency graph contains a cycle.');
 });
 export type MissionDef = z.infer<typeof MissionDefSchema>;
 

@@ -361,3 +361,35 @@ Done since the first cut: independent witnessing (local runner) and the Claude C
 4. **Per-tenant notification endpoints** with an SSRF-safe egress policy; mobile app instead of ntfy-style relay.
 5. **Planner**: optional model-assisted decomposition of a goal into a ledger (operator-approved before release).
 6. **TTS layer** that honours the voice profile Commander already attaches to operator cards.
+
+
+## Dependency-aware missions
+
+Existing missions without `depends_on` retain sequential ordering, including the existing
+operator-skip behavior. To opt into graph scheduling, give **every** step a unique `id`
+and an explicit `depends_on` array. Use `[]` for roots:
+
+```json
+{
+  "title": "Build and verify",
+  "steps": [
+    { "id": "verify", "depends_on": ["build"], "title": "Verify", "directive": "Verify the build", "proof": [{ "type": "exit_code" }] },
+    { "id": "build", "depends_on": [], "title": "Build", "directive": "Build the project", "proof": [{ "type": "exit_code" }] }
+  ]
+}
+```
+
+Commander runs `build` before `verify`, despite their array order. Among ready steps,
+array order is the deterministic tie-breaker. Duplicate IDs or dependencies, unknown
+references, self-dependencies, cycles, and partially specified graphs are rejected before
+mission creation. Operator mission views include `dependency_id` and `depends_on`;
+worker directives still expose only the selected step and the closed-step ledger.
+
+This first scheduling increment keeps one active step per mission and the existing
+MCP/API lease contract. It does **not** introduce parallel worker ownership or automatic
+continuation after quarantine: exhausting attempts still holds the mission for an operator.
+After an operator skips a quarantined graph step, independent ready work can proceed,
+but the skipped step does not satisfy its descendants' prerequisites. If no ready work
+remains, the mission holds as quarantined, rather than falsely reporting completion.
+Dependency definitions persist inside the existing step definitions; historical snapshots
+without them continue to use sequential scheduling.

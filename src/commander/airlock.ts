@@ -35,8 +35,8 @@ import { runWitnessVerifiers, type Witness } from './witness.js';
 /**
  * The Step-Gated Airlock.
  *
- * The mission ledger is held here. A worker is only ever shown the CURRENT step, and step N+1 stays
- * locked until step N's mechanical verifiers pass. Everything that crosses to the worker is built here;
+ * The mission ledger is held here. A worker is only ever shown the CURRENT ready step. Legacy
+ * missions are sequential; explicit graphs release steps after their prerequisites pass. Everything crossing to the worker is built here;
  * nothing the worker says about its own work is ever consulted.
  */
 
@@ -199,6 +199,7 @@ export class Airlock {
         attemptBudget: s.max_attempts,
       })),
     };
+    mission.current = this.readyStepIndex(mission);
     this.state.missions[mission.id] = mission;
     this.d.store.audit(p.tenantId, 'mission.opened', { missionId: mission.id, title: def.title, steps: def.steps.length });
     this.d.store.touch();
@@ -751,16 +752,33 @@ export class Airlock {
     this.d.store.touch();
   }
 
-  /** Moves past the current step. Returns true when the mission is complete. */
+  /** A graph remains single-flight: dependency order changes, worker lease semantics do not. */
+  private readyStepIndex(m: Mission): number {
+    const graph = m.steps.some((s) => s.def.depends_on !== undefined);
+    return m.steps.findIndex((step, index) => {
+      if (step.status !== 'locked') return false;
+      if (!graph) return m.steps.slice(0, index).every((s) => s.status === 'passed' || s.status === 'skipped');
+      return (step.def.depends_on ?? []).every((id) =>
+        m.steps.some((s) => s.def.id === id && s.status === 'passed'),
+      );
+    });
+  }
+
+  /** Selects the next ready step; skipped graph prerequisites never count as verified. */
   private advance(m: Mission): boolean {
-    m.current++;
     m.status = 'active';
     m.pausedFor = undefined;
-    const complete = m.current >= m.steps.length;
+    const complete = m.steps.every((s) => s.status === 'passed' || s.status === 'skipped');
+    const next = this.readyStepIndex(m);
     if (complete) {
       m.status = 'completed';
-      m.current = m.steps.length - 1;
       this.d.store.audit(m.tenantId, 'mission.completed', { missionId: m.id });
+    } else if (next >= 0) {
+      m.current = next;
+    } else {
+      // A skipped prerequisite may leave graph descendants blocked. Do not release them.
+      m.status = 'quarantined';
+      this.d.store.audit(m.tenantId, 'mission.blocked', { missionId: m.id, reason: 'No verified dependency path is ready.' });
     }
     this.touchMission(m);
     return complete;
@@ -810,6 +828,8 @@ export function missionView(m: Mission) {
       index: s.index,
       title: s.def.title,
       directive: s.def.directive,
+      dependency_id: s.def.id,
+      depends_on: s.def.depends_on,
       status: s.status,
       risk_tier: s.def.risk_tier,
       attempt_budget: s.attemptBudget,
