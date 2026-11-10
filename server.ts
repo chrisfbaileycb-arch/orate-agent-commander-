@@ -345,7 +345,7 @@ function computeMissionSphereState(missionId: string): AirlockSphereState {
     return "quarantined";
   }
 
-  if (rawMission.status === "paused" || Boolean(rawMission.pausedFor) || pendingForMission.length > 0) {
+  if (rawMission.status === "paused" || Boolean(rawMission.pausedFor) || pendingForMission.some((a) => a.kind === "clearance")) {
     return "staged";
   }
 
@@ -1125,7 +1125,7 @@ app.get("/v1/operator/missions/:id", (req, res) => {
 app.post("/v1/operator/missions/:id/intervene", (req, res) => {
   try {
     const principal = resolvePrincipal(req, "operator");
-    const body = z.object({ action: z.enum(["kill", "skip"]), reason: z.string().min(1).max(300) }).parse(req.body);
+    const body = z.object({ action: z.enum(["kill", "skip"]), reason: z.string().min(1).max(300), step_id: z.string().min(1).max(100).optional() }).parse(req.body);
     const updated = commander.airlock.intervene(principal, req.params.id!, body);
     recordMissionEvent(
       req.params.id!,
@@ -1356,7 +1356,7 @@ app.post("/api/commander/airlock/proof", async (req, res) => {
     if (result.verdict === "PASSED") {
       recordMissionEvent(rawMission.id, "proof.accepted", result.message, "verified");
     } else if (result.verdict === "QUARANTINED") {
-      recordMissionEvent(rawMission.id, "step.quarantined", result.message, "quarantined");
+      recordMissionEvent(rawMission.id, "step.quarantined", result.message, rawMission.status === "active" ? "idle" : "quarantined");
     } else {
       recordMissionEvent(rawMission.id, "proof.rejected", result.message, "running");
     }
