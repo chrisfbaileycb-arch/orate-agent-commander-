@@ -1,3 +1,4 @@
+import type { Supervision } from './protocol.js';
 import { z } from 'zod';
 
 // Contract schemas (wire format) use snake_case; runtime state types use camelCase.
@@ -7,6 +8,8 @@ export interface Principal {
   tenantId: string;
   keyId: string;
   role: Role;
+  /** Set only by the authenticated supervision protocol. */
+  agentId?: string;
 }
 
 export const ARTIFACT_NAME = /^[A-Za-z0-9_][\w.\-/]{0,119}$/;
@@ -191,6 +194,7 @@ export interface Attempt {
 }
 
 export interface Lease {
+  ownerAgentId?: string;
   id: string;
   issuedAt: number;
   expiresAt: number;
@@ -213,6 +217,7 @@ export interface StepState {
 
 export type MissionStatus = 'active' | 'paused' | 'quarantined' | 'completed' | 'killed';
 export interface Mission {
+  supervision?: Supervision;
   id: string;
   tenantId: string;
   title: string;

@@ -1,3 +1,4 @@
+import { ProtocolRequestSchema, type CommanderProtocol } from './protocol.js';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import type { CallToolResult } from '@modelcontextprotocol/sdk/types.js';
 import { z } from 'zod';
@@ -7,7 +8,7 @@ import { renderClearance, renderClearanceStatus, renderDirective, renderProof } 
 import { ActionRequestSchema, EvidenceSchema, type Principal } from './types.js';
 
 /**
- * The MCP face of Commander. To a client it is one coherent endpoint with five tools. Everything behind
+ * The MCP face of Commander. To a client it is one coherent endpoint with legacy tools and the optional supervision protocol. Everything behind
  * the tools (ledger, verifiers, sentinel, gate) runs server-side; nothing proprietary ships to the client.
  *
  * Boundary worth stating plainly: an MCP server only governs what is routed through it. A worker that
@@ -37,7 +38,7 @@ async function guard(fn: () => CallToolResult | Promise<CallToolResult>): Promis
   }
 }
 
-export function buildMcpServer(principal: Principal, airlock: Airlock): McpServer {
+export function buildMcpServer(principal: Principal, airlock: Airlock, protocol?: CommanderProtocol): McpServer {
   const server = new McpServer({ name: 'agent-commander', version: '0.1.0' });
 
   server.registerTool(
@@ -126,5 +127,14 @@ export function buildMcpServer(principal: Principal, airlock: Airlock): McpServe
     }),
   );
 
+  if (protocol) server.registerTool('commander_supervise', {
+    title: 'Supervise agent workflow',
+    description: 'Protocol v1: register a harness worker, heartbeat, claim ready work, report observations or proof, request clearance, poll status, or leave. Maximum twelve admitted agents; one executing step per mission. Capabilities are self-reported. Use only this tool for protocol-enabled missions.',
+    inputSchema: { mission_id: z.string().min(1).max(64), request: ProtocolRequestSchema },
+    annotations: { readOnlyHint: false, openWorldHint: false },
+  }, ({ mission_id, request }) => guard(async () => {
+    const result = await protocol.dispatch(principal, mission_id, request);
+    return ok(JSON.stringify(result), result);
+  }));
   return server;
 }

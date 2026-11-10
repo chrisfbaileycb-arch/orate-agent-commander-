@@ -186,7 +186,7 @@ export function createHttpServer(app: App): Server {
         return sendJson(res, 405, { jsonrpc: '2.0', error: { code: -32000, message: 'Method not allowed.' }, id: null }, { allow: 'POST' });
       }
       const body = await readJson(req);
-      const server = buildMcpServer(principal, app.airlock);
+      const server = buildMcpServer(principal, app.airlock, app.protocol);
       const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined, enableJsonResponse: true });
       res.on('close', () => {
         void transport.close();
@@ -195,6 +195,13 @@ export function createHttpServer(app: App): Server {
       await server.connect(transport);
       await transport.handleRequest(req, res, body);
       return;
+    }
+
+    if ((m = /^\/v1\/protocol\/missions\/([\w-]+)$/.exec(path)) && method === 'POST') {
+      return sendJson(res, 200, await app.protocol.dispatch(principal, m[1]!, await readJson(req)));
+    }
+    if ((m = /^\/v1\/operator\/missions\/([\w-]+)\/protocol$/.exec(path)) && method === 'POST') {
+      return sendJson(res, 200, app.protocol.configure(principal, m[1]!, await readJson(req)));
     }
 
     if (path.startsWith('/v1/operator/')) {

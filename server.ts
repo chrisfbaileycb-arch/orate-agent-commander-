@@ -1040,11 +1040,21 @@ app.post("/v1/guard/clearance", async (req, res) => {
   }
 });
 
+// Protocol v1 uses the same service and validation over HTTP and MCP.
+app.post("/v1/operator/missions/:id/protocol", (req, res) => {
+  try { res.json(commander.protocol.configure(resolvePrincipal(req, "operator"), req.params.id!, req.body)); }
+  catch (err) { handleCommanderError(err, res); }
+});
+app.post("/v1/protocol/missions/:id", async (req, res) => {
+  try { res.json(await commander.protocol.dispatch(resolvePrincipal(req, "worker"), req.params.id!, req.body)); }
+  catch (err) { handleCommanderError(err, res); }
+});
+
 // MCP StreamableHTTP endpoint
 app.post("/v1/mcp", async (req, res) => {
   try {
     const principal = resolvePrincipal(req, "worker");
-    const server = buildMcpServer(principal, commander.airlock);
+    const server = buildMcpServer(principal, commander.airlock, commander.protocol);
     const transport = new StreamableHTTPServerTransport({
       sessionIdGenerator: undefined,
       enableJsonResponse: true,

@@ -417,3 +417,5 @@ authorization is required for each additional attempt budget. This change does n
 parallel worker ownership or automatic instruction rewriting.
 Dependency definitions persist inside the existing step definitions; historical snapshots
 without them continue to use sequential scheduling.
+
+Protocol v1 and adapter integration: [PROTOCOL.md](PROTOCOL.md).
