@@ -367,6 +367,7 @@ describe("an anonymous caller can reach nothing that matters", () => {
     ["POST", "/v1/operator/approvals/apr_1/decision", { decision: "authorize" }],
     ["GET", "/v1/operator/audit"],
     ["POST", "/v1/mcp", {}],
+    ["POST", "/v1/protocol/missions/msn_unknown", {}],
     ["POST", "/v1/guard/clearance", { action: { kind: "shell", payload: "ls" } }],
     ["POST", "/v1/admin/tenants", { name: "mine", credits: 1_000_000 }],
     ["POST", "/v1/admin/tenants/ten_1/credits", { amount: 1000 }],
@@ -1057,4 +1058,23 @@ describe("when no unlock token is configured", () => {
       expect((await rawRequest(dev, "POST", "/api/cockpit/session", o)).status, why).toBe(401);
     }
   });
+});
+
+
+it("exposes protocol registration and claims with bearer auth on the production server", async () => {
+  const t = await newTenant(main);
+  const created = await http(main, "POST", "/v1/operator/missions", { bearer: t.op, body: {
+    title: "Protocol smoke", steps: [{ title: "Check", directive: "Check outcome", proof: [{ type: "exit_code" }] }],
+  } });
+  expect(created.status).toBe(201);
+  const id = created.json.id;
+  expect((await http(main, "POST", `/v1/operator/missions/${id}/protocol`, { bearer: t.op, body: { max_agents: 2 } })).status).toBe(200);
+  const session = await http(main, "POST", `/v1/protocol/missions/${id}`, { bearer: t.worker, body: {
+    action: "register", name: "smoke", harness: "custom", capabilities: ["observations"],
+  } });
+  expect(session.status).toBe(200);
+  const claim = await http(main, "POST", `/v1/protocol/missions/${id}`, { bearer: t.worker, body: {
+    action: "claim", session_id: session.json.session_id,
+  } });
+  expect(claim.json.state).toBe("DIRECTIVE");
 });

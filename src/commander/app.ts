@@ -1,3 +1,4 @@
+import { CommanderProtocol } from './protocol.js';
 import { Airlock } from './airlock.js';
 import { ConsoleNotifier, Approvals, LinkSigner, WebhookNotifier, type Notifier } from './approvals.js';
 import { Auth } from './auth.js';
@@ -15,6 +16,7 @@ export interface App {
   auth: Auth;
   approvals: Approvals;
   airlock: Airlock;
+  protocol: CommanderProtocol;
 }
 
 export interface AppOptions {
@@ -67,5 +69,6 @@ export function createApp(opts: AppOptions): App {
   const witness = runner ? { runner, allows: (tenantId: string) => tenants === '*' || tenants.includes(tenantId) } : undefined;
 
   const airlock = new Airlock({ store, auth, sentinel, gate, approvals, policy: config.policy, clock, witness });
-  return { config, clock, store, auth, approvals, airlock };
+  const protocol = new CommanderProtocol(store, airlock, auth, clock);
+  return { config, clock, store, auth, approvals, airlock, protocol };
 }

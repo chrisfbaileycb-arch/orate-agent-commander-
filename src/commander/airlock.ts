@@ -274,12 +274,16 @@ export class Airlock {
   getDirective(p: Principal, missionId: string): DirectiveResult {
     this.d.auth.requireRole(p, 'worker');
     const m = lookup(this.state.missions, missionId, p.tenantId);
+    this.requireAgent(m, p);
     const closed = this.closedState(m);
     if (closed) return closed;
 
     this.d.auth.charge(p, 'directive', m.id);
     const now = this.d.clock();
     const step = m.steps[m.current]!;
+    if (step.lease && !step.lease.revoked && step.lease.expiresAt > now && step.lease.ownerAgentId && step.lease.ownerAgentId !== p.agentId) {
+      throw new CommanderError('CONFLICT', 'Current directive belongs to another agent.');
+    }
 
     if (step.status === 'locked') {
       step.status = 'released';
@@ -333,9 +337,10 @@ export class Airlock {
   async submitProof(p: Principal, missionId: string, input: { lease_id: string; evidence: unknown }): Promise<ProofResult> {
     this.d.auth.requireRole(p, 'worker');
     const m = lookup(this.state.missions, missionId, p.tenantId);
+    this.requireAgent(m, p);
     this.requireActive(m);
     const step = this.currentStep(m);
-    this.requireLease(step, input.lease_id);
+    this.requireLease(step, input.lease_id, p);
     if (this.auditing.has(step.id)) {
       throw new CommanderError('CONFLICT', say.conflict('A proof for this step is already being audited.'));
     }
@@ -491,9 +496,10 @@ export class Airlock {
   async requestClearance(p: Principal, missionId: string, input: { lease_id: string; action: unknown }): Promise<ClearanceResult> {
     this.d.auth.requireRole(p, 'worker');
     const m = lookup(this.state.missions, missionId, p.tenantId);
+    this.requireAgent(m, p);
     this.requireActive(m);
     const step = this.currentStep(m);
-    this.requireLease(step, input.lease_id);
+    this.requireLease(step, input.lease_id, p);
     return this.adjudicate(p, m, step, input.lease_id, this.parseAction(input.action), { source: 'mcp' });
   }
 
@@ -504,6 +510,7 @@ export class Airlock {
   async requestGuardClearance(p: Principal, missionId: string, input: { action: unknown; tool?: string }): Promise<ClearanceResult> {
     this.d.auth.requireRole(p, 'worker');
     const m = lookup(this.state.missions, missionId, p.tenantId);
+    this.requireAgent(m, p);
     this.requireActive(m);
     const step = this.currentStep(m);
     const lease = step.lease;
@@ -758,7 +765,12 @@ export class Airlock {
     return !!l && l.id === leaseId && !l.revoked && l.expiresAt > this.d.clock();
   }
 
-  private requireLease(step: StepState, leaseId: string): void {
+  private requireAgent(m: Mission, p: Principal): void {
+    if (m.supervision && !p.agentId) throw new CommanderError('FORBIDDEN', 'Use the supervision protocol for this mission.');
+  }
+
+  private requireLease(step: StepState, leaseId: string, p: Principal): void {
+    if (step.lease?.ownerAgentId && step.lease.ownerAgentId !== p.agentId) throw new CommanderError('LEASE_INVALID', 'Lease belongs to another agent.');
     if (!this.leaseValid(step, leaseId)) throw new CommanderError('LEASE_INVALID', say.leaseInvalid());
   }
 
@@ -845,6 +857,11 @@ export function missionView(m: Mission) {
     title: m.title,
     status: m.status,
     current_index: m.current,
+    supervision: m.supervision ? {
+      version: m.supervision.version, max_agents: m.supervision.max_agents,
+      heartbeat_seconds: m.supervision.heartbeat_seconds, execution_concurrency: 1,
+      agents: m.supervision.sessions.map(({ keyId: _key, ...session }) => session),
+    } : undefined,
     created_at: m.createdAt,
     updated_at: m.updatedAt,
     paused_for: m.pausedFor,

@@ -122,7 +122,7 @@ function classifyNormalized(method: string, p: string): RouteClass {
   if (p === "/api/cockpit/session") return "public";
   if (/^\/a\/[a-z0-9_-]+(?:\/decide)?$/.test(p)) return "public";
   if (p === "/v1/admin" || p.startsWith("/v1/admin/")) return "admin";
-  for (const prefix of ["/v1/operator", "/v1/mcp", "/v1/guard"]) {
+  for (const prefix of ["/v1/operator", "/v1/mcp", "/v1/guard", "/v1/protocol"]) {
     if (p === prefix || p.startsWith(`${prefix}/`)) return "bearer";
   }
   if (STUDIO_ROUTES.has(`${method} ${p}`)) return "studio";

@@ -1,3 +1,4 @@
+import { httpProtocolTransport, mcpProtocolTransport } from './protocol-client.js';
 import type { Server } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
@@ -178,7 +179,7 @@ describe('authentication and roles', () => {
 });
 
 describe('MCP gateway end to end', () => {
-  it('exposes exactly the five commander tools', async () => {
+  it('exposes the legacy tools and the supervision protocol', async () => {
     const t = await newTenant();
     const client = await connect(t.worker);
     const { tools } = await client.listTools();
@@ -188,6 +189,7 @@ describe('MCP gateway end to end', () => {
       'commander_mission_status',
       'commander_request_clearance',
       'commander_submit_proof',
+      'commander_supervise',
     ]);
     expect(tools.find((x) => x.name === 'commander_submit_proof')!.inputSchema.properties).toHaveProperty('evidence');
   });
@@ -429,4 +431,31 @@ it('continues graph work over MCP and targets a non-current quarantine over REST
   } finally {
     await client.close();
   }
+});
+
+
+it('shares authenticated supervision state between HTTP and MCP', async () => {
+  const t = await newTenant();
+  const id = await openMission(t.op, soloMission);
+  const configured = await call('POST', `/v1/operator/missions/${id}/protocol`, { key: t.op, body: { max_agents: 1 } });
+  expect(configured.status).toBe(200);
+  const registered = await call('POST', `/v1/protocol/missions/${id}`, { key: t.worker, body: {
+    action: 'register', name: 'custom-worker', harness: 'http-example', capabilities: ['clearance', 'observations'],
+  } });
+  expect(registered.json.status).toBe('active');
+  const client = await connect(t.worker);
+  try {
+    const mcpAdapter = mcpProtocolTransport(client.callTool.bind(client), id);
+    const httpAdapter = httpProtocolTransport(base, id, t.worker);
+    const d = await mcpAdapter({ action: 'claim', session_id: registered.json.session_id });
+    expect(d.state).toBe('DIRECTIVE');
+    const proof = await httpAdapter({
+      action: 'proof', session_id: registered.json.session_id, lease_id: d.lease_id as string, evidence: { exit_code: 0 },
+    });
+    expect(proof.verdict).toBe('PASSED');
+    const status = sc(await client.callTool({ name: 'commander_supervise', arguments: {
+      mission_id: id, request: { action: 'status', session_id: registered.json.session_id },
+    } }));
+    expect(status).toMatchObject({ mission_status: 'completed', should_stop: true });
+  } finally { await client.close(); }
 });
