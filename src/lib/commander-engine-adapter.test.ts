@@ -219,3 +219,16 @@ describe("Commander Engine Adapter — Live State Machine & Security Invariants"
     expect(isMutatingVoiceCommand("Show audit chain depth")).toBe(false);
   });
 });
+
+
+it("keeps independent work running with a pending quarantine approval", () => {
+  const now = Date.now();
+  const active = {
+    status: "active",
+    approvals: [{ kind: "quarantine", status: "pending" }],
+    last_event: { type: "step.quarantined" },
+    current_step: { status: "released", lease_id: "lease_independent", lease_revoked: false,
+      lease_expires_at: new Date(now + 60000).toISOString() },
+  } as unknown as Partial<LiveMissionPayload>;
+  expect(deriveSphereState(active, now)).toBe("running");
+});
