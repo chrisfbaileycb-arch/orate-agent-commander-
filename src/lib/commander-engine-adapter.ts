@@ -197,7 +197,7 @@ export function deriveSphereState(
   if (!mission) return "idle";
 
   const step = mission.current_step;
-  const pendingCount = countPendingGates(mission.approvals);
+  const pendingCount = countPendingGates(mission.approvals?.filter((a) => a.kind === "clearance"));
   const lastEventType = mission.last_event?.type ?? "";
 
   // 1. QUARANTINED (Glitch Red): Attempts exhausted, budget breached, killed, or violation detected
@@ -207,7 +207,7 @@ export function deriveSphereState(
     step?.status === "quarantined" ||
     (mission.tenant && mission.tenant.credits <= 0) ||
     lastEventType === "clearance.denied" ||
-    lastEventType === "step.quarantined" ||
+    (lastEventType === "step.quarantined" && mission.status !== "active") ||
     lastEventType === "mission.killed" ||
     (step && step.attempt > step.attempt_budget)
   ) {
