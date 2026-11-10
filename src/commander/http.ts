@@ -110,7 +110,7 @@ const LINK_CSP = "default-src 'none'; style-src 'unsafe-inline'; base-uri 'none'
 // ---- schemas ----------------------------------------------------------------------------------
 
 const DecisionBody = z.object({ decision: z.enum(['authorize', 'redirect', 'kill']), note: z.string().max(400).optional() });
-const InterveneBody = z.object({ action: z.enum(['kill', 'skip']), reason: z.string().min(1).max(300) });
+const InterveneBody = z.object({ action: z.enum(['kill', 'skip']), reason: z.string().min(1).max(300), step_id: z.string().min(1).max(100).optional() });
 const KeyBody = z.object({ label: z.string().max(80).optional() });
 const TenantBody = z.object({ name: z.string().min(1).max(100), credits: z.number().min(0).max(1e9) });
 const TopUpBody = z.object({ amount: z.number().positive().max(1e9) });

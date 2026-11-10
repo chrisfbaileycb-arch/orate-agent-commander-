@@ -385,11 +385,35 @@ references, self-dependencies, cycles, and partially specified graphs are reject
 mission creation. Operator mission views include `dependency_id` and `depends_on`;
 worker directives still expose only the selected step and the closed-step ledger.
 
-This first scheduling increment keeps one active step per mission and the existing
-MCP/API lease contract. It does **not** introduce parallel worker ownership or automatic
-continuation after quarantine: exhausting attempts still holds the mission for an operator.
-After an operator skips a quarantined graph step, independent ready work can proceed,
-but the skipped step does not satisfy its descendants' prerequisites. If no ready work
-remains, the mission holds as quarantined, rather than falsely reporting completion.
+Graph missions keep one active step per mission and the existing MCP/API lease contract.
+When a step exhausts its attempt budget, Commander revokes its lease, quarantines that
+step, creates an operator approval, and automatically selects independent ready work.
+The proof result is still `QUARANTINED` for the failed step, but the mission can remain
+`active`; workers should pull the next directive rather than assume the mission stopped.
+Dependents remain locked until their prerequisites actually pass. When no ready work
+remains and unresolved steps exist, the mission holds as `quarantined`, not completed.
+Legacy sequential missions continue to hold immediately on an exhausted step.
+
+A quarantine approval targets its original step even after the current step has changed.
+Authorize or redirect adds one configured attempt budget and queues that step for repair.
+A redirect appends the operator's correction to its directive. Reopening does not replace
+an independent lease or dismiss a clearance awaiting authorization; the repair runs once
+the current work yields. Completed steps and their evidence are preserved. Multiple failed
+branches retain separate approvals. Kill remains mission-wide.
+
+The operator intervention endpoint accepts an optional runtime `step_id` to skip a
+non-current quarantined step. Omitting it retains the historical current-step behavior:
+
+```json
+{ "action": "skip", "step_id": "stp_example", "reason": "Leave this branch unresolved" }
+```
+
+Skipping never satisfies graph dependencies. If an operator skips a prerequisite,
+its descendants stay blocked; independent work may continue. Operator mission views
+include `blocked_by` (declared dependency IDs without verified results) per step.
+Pending quarantine approvals remain visible without marking independent work paused.
+Attempt limits count proof submissions, not every tool call or external model request;
+authorization is required for each additional attempt budget. This change does not add
+parallel worker ownership or automatic instruction rewriting.
 Dependency definitions persist inside the existing step definitions; historical snapshots
 without them continue to use sequential scheduling.

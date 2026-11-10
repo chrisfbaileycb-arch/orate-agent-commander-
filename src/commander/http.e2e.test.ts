@@ -393,3 +393,40 @@ describe('limits (these run last: they exhaust per-address throttles)', () => {
     expect(retryAfter).toBeTruthy();
   });
 });
+
+it('continues graph work over MCP and targets a non-current quarantine over REST', async () => {
+  const t = await newTenant();
+  const id = await openMission(t.op, {
+    title: 'Branch recovery',
+    steps: [
+      { id: 'bad', depends_on: [], title: 'Bad', directive: 'Fail once', max_attempts: 1, proof: [{ type: 'exit_code' }] },
+      { id: 'child', depends_on: ['bad'], title: 'Child', directive: 'Must wait', proof: [{ type: 'exit_code' }] },
+      { id: 'good', depends_on: [], title: 'Good', directive: 'Independent work', proof: [{ type: 'exit_code' }] },
+    ],
+  });
+  const client = await connect(t.worker);
+  try {
+    const d = sc(await client.callTool({ name: 'commander_get_directive', arguments: { mission_id: id } }));
+    const failed = sc(await client.callTool({ name: 'commander_submit_proof', arguments: {
+      mission_id: id, lease_id: d.lease_id, evidence: { exit_code: 1 },
+    } }));
+    expect(failed.verdict).toBe('QUARANTINED');
+    const next = sc(await client.callTool({ name: 'commander_get_directive', arguments: { mission_id: id } }));
+    expect(next.directive).toBe('Independent work');
+    const skipped = await call('POST', `/v1/operator/missions/${id}/intervene`, {
+      key: t.op, body: { action: 'skip', step_id: d.step_ref, reason: 'Leave failed branch unresolved' },
+    });
+    expect(skipped.status).toBe(200);
+    expect(skipped.json.steps[0].status).toBe('skipped');
+    expect(skipped.json.steps[1].blocked_by).toEqual(['bad']);
+    const repeated = sc(await client.callTool({ name: 'commander_get_directive', arguments: { mission_id: id } }));
+    expect(repeated.lease_id).toBe(next.lease_id);
+    await client.callTool({ name: 'commander_submit_proof', arguments: {
+      mission_id: id, lease_id: next.lease_id, evidence: { exit_code: 0 },
+    } });
+    const hold = sc(await client.callTool({ name: 'commander_get_directive', arguments: { mission_id: id } }));
+    expect(hold.state).toBe('HOLD');
+  } finally {
+    await client.close();
+  }
+});
