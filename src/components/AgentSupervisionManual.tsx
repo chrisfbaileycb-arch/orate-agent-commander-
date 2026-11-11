@@ -22,6 +22,7 @@ interface Props {
   isDemoSimulation: boolean;
   onEnterCockpit: () => void;
   onEnterWeave: () => void;
+  onExportTelemetry?: () => void;
   onTriggerLifecycle?: (
     action: "idle" | "running" | "staged" | "native_intercept" | "verified" | "quarantined"
   ) => void;
@@ -119,6 +120,7 @@ export default function AgentSupervisionManual({
   isDemoSimulation,
   onEnterCockpit,
   onEnterWeave,
+  onExportTelemetry,
   onTriggerLifecycle,
 }: Props) {
   const defaultOrigin =
@@ -258,6 +260,17 @@ export default function AgentSupervisionManual({
               >
                 Inspect Pipeline Weave
               </button>
+
+              {onExportTelemetry && (
+                <button
+                  type="button"
+                  data-testid="cover-export-telemetry-btn"
+                  onClick={onExportTelemetry}
+                  className="rounded-xl border border-emerald-500/70 bg-emerald-950/60 hover:bg-emerald-900/80 px-4 py-2 text-xs font-bold uppercase tracking-wider text-emerald-100 transition text-center"
+                >
+                  ⬇ Export Telemetry & Failure JSON
+                </button>
+              )}
 
               <button
                 type="button"

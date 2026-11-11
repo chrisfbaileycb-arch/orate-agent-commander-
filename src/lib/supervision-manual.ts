@@ -113,7 +113,13 @@ export function buildCustomSwarmHttpLoopSnippet(params: ManualConfigParams): str
   const token = params.workerTokenPlaceholder.trim() || "cmd_live_YOUR_WORKER_TOKEN";
 
   return [
-    `# 1. Request pre-execution clearance from Perimeter Sentinel (/v1/guard/clearance)`,
+    `# 1. Register & claim ready work via Supervision Protocol v1 (/v1/protocol/missions/:id)`,
+    `curl -s -X POST ${url}/v1/protocol/missions/${mission} \\`,
+    `  -H "Authorization: Bearer ${token}" \\`,
+    `  -H "Content-Type: application/json" \\`,
+    `  -d '{"action":"register","name":"worker-1","harness":"custom-swarm/1.0","capabilities":["clearance","observations","cancellation"]}'`,
+    ``,
+    `# 2. Request pre-execution clearance from Perimeter Sentinel (/v1/guard/clearance)`,
     `curl -s -X POST ${url}/v1/guard/clearance \\`,
     `  -H "Authorization: Bearer ${token}" \\`,
     `  -H "Content-Type: application/json" \\`,
@@ -127,7 +133,7 @@ export function buildCustomSwarmHttpLoopSnippet(params: ManualConfigParams): str
     `    }`,
     `  }'`,
     ``,
-    `# 2. Verify mechanical proof against step verifiers (/v1/verifiers/verify)`,
+    `# 3. Verify mechanical proof against step verifiers (/v1/verifiers/verify)`,
     `curl -s -X POST ${url}/v1/verifiers/verify \\`,
     `  -H "Content-Type: application/json" \\`,
     `  -d '{`,
@@ -161,6 +167,8 @@ export function buildMissionBlueprintJson(): string {
       title: "Release 4.2 · Sovereign Production Cutover",
       steps: [
         {
+          id: "verify_manifest",
+          depends_on: [],
           title: "Verify workspace manifest & pass unit suite",
           directive:
             "Run the repository test suite, echo the step nonce in stdout, and ensure package.json is intact on disk.",
@@ -180,6 +188,8 @@ export function buildMissionBlueprintJson(): string {
           ],
         },
         {
+          id: "schema_migration",
+          depends_on: ["verify_manifest"],
           title: "Execute zero-downtime schema migration",
           directive:
             "Apply additive SQL migrations only. Any destructive DDL is intercepted and staged for operator review.",

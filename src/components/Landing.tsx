@@ -8,7 +8,12 @@ import ByokKeyControl from "./ByokKeyControl";
 import { LEDGER_QUERY_UNREACHABLE, ledgerQueryOutcome } from "../lib/ledger-query";
 import SlideOverAppViewport from "./SlideOverAppViewport";
 import AgentSupervisionManual from "./AgentSupervisionManual";
+import TelemetryExportModal from "./TelemetryExportModal";
 import { getDefaultCoverPageOpen } from "../lib/supervision-manual";
+import {
+  buildSessionTelemetryExport,
+  downloadSessionTelemetryJson,
+} from "../lib/telemetry-export";
 import { orate, hush, listen, listeningSupported, type ListenHandle } from "../lib/voice";
 import {
   deriveProvenanceBadge,
@@ -88,10 +93,11 @@ const SPHERE_STATE_META: Record<
   },
 };
 
-export default function Landing(_props: Props) {
+export default function Landing(props: Props) {
   const [currentAct, setCurrentAct] = useState<"manual" | "audience" | "weave" | "reveal">(() =>
     getDefaultCoverPageOpen() ? "manual" : "audience"
   );
+  const [isTelemetryModalOpen, setIsTelemetryModalOpen] = useState(false);
 
   // Live Engine Adapter connected to GET /v1/missions/:id, GET /v1/audit/verify, and SSE /v1/events
   const {
@@ -480,6 +486,15 @@ export default function Landing(_props: Props) {
           >
             Live HUD Cockpit
           </button>
+          <button
+            type="button"
+            data-testid="export-telemetry-btn"
+            onClick={() => setIsTelemetryModalOpen(true)}
+            className="px-2.5 py-1 rounded border border-emerald-500/70 bg-emerald-950/70 hover:bg-emerald-900/90 text-emerald-100 text-xs font-bold tracking-wider uppercase transition"
+            title="Export session telemetry, forge activity, failure diagnostics, and next-run recommendations as JSON"
+          >
+            ⬇ Export Telemetry JSON
+          </button>
 
           <span aria-hidden="true" className="text-slate-700 px-0.5">
             |
@@ -567,6 +582,7 @@ export default function Landing(_props: Props) {
           isDemoSimulation={isDemoSimulation}
           onEnterCockpit={() => setCurrentAct("audience")}
           onEnterWeave={() => setCurrentAct("weave")}
+          onExportTelemetry={() => setIsTelemetryModalOpen(true)}
           onTriggerLifecycle={(action) => void handleLifecycleAction(action)}
         />
       )}
@@ -1014,21 +1030,43 @@ export default function Landing(_props: Props) {
                   </div>
                 </div>
 
-                {/* Secondary Action to Open Supervision Manual or View Pipeline Weave */}
-                <div className="pt-1.5 border-t border-slate-700/70 flex items-center justify-between text-xs">
+                {/* Secondary Action to Open Supervision Manual, Export Telemetry, or View Pipeline Weave */}
+                <div className="pt-1.5 border-t border-slate-700/70 flex items-center justify-between gap-2 text-xs">
                   <button
                     type="button"
                     onClick={() => setCurrentAct("manual")}
                     className="text-slate-300 hover:text-white font-semibold transition"
                   >
-                    ← Supervision Manual
+                    ← Manual
+                  </button>
+                  <button
+                    type="button"
+                    data-testid="cockpit-quick-export-json-btn"
+                    onClick={() => {
+                      const payload = buildSessionTelemetryExport({
+                        session: props.session,
+                        telemetry: props.telemetry,
+                        explorations: props.explorations,
+                        remainingExplorations: props.remainingExplorations,
+                        mission,
+                        auditChain: audit,
+                        sphereState,
+                        isDemoSimulation,
+                        sseConnected,
+                      });
+                      downloadSessionTelemetryJson(payload);
+                      setIsTelemetryModalOpen(true);
+                    }}
+                    className="text-emerald-300 hover:text-white font-bold transition"
+                  >
+                    ⬇ Export JSON
                   </button>
                   <button
                     type="button"
                     onClick={() => setCurrentAct("weave")}
                     className="text-cyan-200 hover:text-white font-bold tracking-wider uppercase transition"
                   >
-                    Pipeline Weave ➔
+                    Weave ➔
                   </button>
                 </div>
               </section>
@@ -1179,6 +1217,23 @@ export default function Landing(_props: Props) {
         activePrompt={activePrompt}
         onClose={() => setIsAppDrawerOpen(false)}
       />
+
+      {isTelemetryModalOpen && (
+        <TelemetryExportModal
+          telemetryExport={buildSessionTelemetryExport({
+            session: props.session,
+            telemetry: props.telemetry,
+            explorations: props.explorations,
+            remainingExplorations: props.remainingExplorations,
+            mission,
+            auditChain: audit,
+            sphereState,
+            isDemoSimulation,
+            sseConnected,
+          })}
+          onClose={() => setIsTelemetryModalOpen(false)}
+        />
+      )}
     </div>
   );
 }

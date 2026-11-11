@@ -45,7 +45,10 @@ export function useScarcityAlerts(enabled: boolean): ScarcityAlert[] {
 
 /** ---------- Deterministic-ish capacity telemetry ---------- */
 
-export function computeTelemetry(sessionCount: number): ScarcityTelemetry {
+export function computeTelemetry(
+  sessionCount: number,
+  errors: import("./types").TelemetryErrorEntry[] = []
+): ScarcityTelemetry {
   const maxBuilds = 10;
   const now = new Date();
   const hourWave = Math.sin((now.getHours() + now.getMinutes() / 60) * (Math.PI / 12));
@@ -56,5 +59,6 @@ export function computeTelemetry(sessionCount: number): ScarcityTelemetry {
     activeBuilds,
     maxBuilds,
     slotsRemaining: Math.max(0, maxBuilds - activeBuilds),
+    errors,
   };
 }

@@ -124,9 +124,23 @@ export interface BookingRecord {
   createdAt: number;
 }
 
+export interface TelemetryErrorEntry {
+  id?: string;
+  task: string;
+  failedTask?: string;
+  whereItFailed?: string;
+  reason: string;
+  recommendedCorrection: string;
+  recommendedCorrections?: string[];
+  stage?: string;
+  severity?: "warning" | "error" | "critical";
+  timestamp?: string;
+}
+
 export interface ScarcityTelemetry {
   capacityPct: number;
   activeBuilds: number;
   maxBuilds: number;
   slotsRemaining: number;
+  errors?: TelemetryErrorEntry[];
 }
